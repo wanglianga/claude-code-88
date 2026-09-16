@@ -1,0 +1,17 @@
+{
+  "name": "laundry-server",
+  "private": true,
+  "version": "1.0.0",
+  "description": "社区自助洗衣房排队/故障/错拿协同处理平台 - 后端",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.12.0"
+  }
+}
