@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { api } from '../api';
 import type { Board, Device, Order, Quote, Site, WashMode } from '../types';
-import { DEVICE_STATUS, ORDER_STATUS, fen, fmtTime, remainText, overdueText, SITE_KIND } from '../utils';
+import { DEVICE_STATUS, ORDER_STATUS, PAY_STATUS, fen, fmtTime, remainText, overdueText, SITE_KIND } from '../utils';
 import { ok, err } from '../toast';
 import DeviceCard from '../components/DeviceCard.vue';
 import Modal from '../components/Modal.vue';
@@ -258,7 +258,7 @@ onUnmounted(() => { clearInterval(tickTimer); clearInterval(pollTimer); });
         <div><div class="muted">金额</div><b>{{ fen(active.amount_cents) }}</b>
           <span v-if="active.discount_cents > 0" class="muted">（已优惠 {{ fen(active.discount_cents) }}）</span>
         </div>
-        <div><div class="muted">支付</div>{{ active.pay_status === 'paid' ? '已支付' : '待支付' }}</div>
+        <div><div class="muted">支付</div>{{ PAY_STATUS[active.pay_status] || active.pay_status }}</div>
       </div>
 
       <!-- 待支付 -->

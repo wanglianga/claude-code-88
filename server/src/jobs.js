@@ -75,12 +75,17 @@ async function sweep() {
     await notify(o.user_id, 'overdue', '取衣已超时', `订单 ${o.order_no} 已超过取衣宽限，信用 -5。请尽快取衣，超时过久将由保洁代收。`);
   }
 
-  // 5. 设备状态一致性校正
+  // 5. 设备状态一致性校正（故障/维修/离线不干预）
   await q(
     `UPDATE devices d SET status='idle'
      WHERE d.status IN ('running','finished')
        AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.device_id=d.id AND o.status IN ('running','finished'))
        AND d.status NOT IN ('fault','maintenance','offline')`);
+  // 队列漂移校正：退款/取消后 queued 设备已无已支付订单 → 回到空闲
+  await q(
+    `UPDATE devices d SET status='idle'
+     WHERE d.status='queued'
+       AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.device_id=d.id AND o.status='paid')`);
   await q(
     `UPDATE devices d SET status='queued'
      WHERE d.status='idle' AND EXISTS (SELECT 1 FROM orders o WHERE o.device_id=d.id AND o.status='paid')`);

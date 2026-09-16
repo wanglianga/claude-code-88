@@ -265,10 +265,12 @@ router.post('/orders/:id/cancel', auth, ah(async (req, res) => {
     if (o.status === 'paid') {
       await c.query(`INSERT INTO refunds(order_id, user_id, amount_cents, reason, status, processed_at) VALUES($1,$2,$3,'用户取消自动退款','paid', now())`, [o.id, o.user_id, o.amount_cents]);
       await c.query(`UPDATE orders SET status='cancelled', pay_status='refunded', closed_at=now() WHERE id=$1`, [o.id]);
+      // 已支付订单占着队列槽位：释放并重算设备队列、通知下一位
+      await notifyNextInQueue(c, o.device_id);
     } else {
+      // 未支付预约不占队列，直接关闭即可
       await c.query(`UPDATE orders SET status='cancelled', closed_at=now() WHERE id=$1`, [o.id]);
     }
-    await notifyNextInQueue(c, o.device_id);
   });
   res.json({ ok: true, message: o.status === 'paid' ? '已取消并原路退款' : '预约已取消' });
 }));
@@ -457,33 +459,81 @@ router.get('/refunds', auth, ah(async (req, res) => {
   res.json(rows);
 }));
 
+/**
+ * 退款审批：按订单所处阶段结算，工单/退款/订单/设备/队列/通知/档案使用同一处置结论。
+ * - booked/paid（未启动）全额退款：同事务关闭订单、结算支付、释放/重排设备队列并通知下一位；
+ * - booked/paid 部分退款：订单继续有效，仅标记 partial_refunded；
+ * - running/finished（已启动/已完成）：保留实际服务状态，仅结算支付标记，不释放在用设备；
+ * - 幂等：订单行锁 + 原子认领退款单，撤销/重复审批不产生二次退款、重复通知或队列跳位。
+ */
 router.post('/refunds/:id/approve', auth, requireRole('service', 'property'), ah(async (req, res) => {
   const r = await one('SELECT * FROM refunds WHERE id=$1', [req.params.id]);
   if (!r) return bad(res, '退款单不存在', 404);
-  if (r.status !== 'requested') return bad(res, '该退款已处理');
-  await tx(async (c) => {
-    await c.query(`UPDATE refunds SET status='paid', processed_by=$1, processed_at=now() WHERE id=$2`, [req.user.id, r.id]);
-    const o = await c.query('SELECT * FROM orders WHERE id=$1', [r.order_id]);
-    const full = r.amount_cents >= o.rows[0].amount_cents;
-    await c.query(`UPDATE orders SET pay_status=$1 WHERE id=$2`, [full ? 'refunded' : 'partial_refunded', r.order_id]);
-    if (r.ticket_id) {
-      await c.query(`UPDATE tickets SET status='resolved', resolution=$1, updated_at=now() WHERE id=$2`, [`退款 ¥${(r.amount_cents / 100).toFixed(2)} 已原路退回`, r.ticket_id]);
-      await ticketEvent(c, r.ticket_id, req.user, 'refund', `退款 ¥${(r.amount_cents / 100).toFixed(2)} 已批准并退回`);
+  const amountText = `¥${(r.amount_cents / 100).toFixed(2)}`;
+  const result = await tx(async (c) => {
+    // 锁定订单行：与并发审批/用户取消串行化，保证同一订单只有一个处置结论
+    const o = (await c.query('SELECT * FROM orders WHERE id=$1 FOR UPDATE', [r.order_id])).rows[0];
+    if (!o) return { error: '关联订单不存在', code: 404 };
+    if (o.pay_status === 'unpaid') return { error: '订单未支付，无款可退，请驳回该申请' };
+    if (o.pay_status === 'refunded') return { error: '该订单已全额退款，请勿重复审批' };
+    // 原子认领：仅待审核的退款单可被处理，重复/并发审批落空，不会二次退款
+    const claim = await c.query(
+      `UPDATE refunds SET status='paid', processed_by=$1, processed_at=now() WHERE id=$2 AND status='requested' RETURNING id`,
+      [req.user.id, r.id]);
+    if (!claim.rows[0]) return { error: '该退款已处理' };
+
+    const full = r.amount_cents >= o.amount_cents;
+    const notStarted = ['booked', 'paid'].includes(o.status);
+    let path;
+    if (notStarted && full) {
+      // 未启动全额退款：关闭订单、结算支付、释放/重排设备队列并通知下一位
+      await c.query(`UPDATE orders SET pay_status='refunded', status='cancelled', closed_at=now() WHERE id=$1`, [o.id]);
+      await notifyNextInQueue(c, o.device_id);
+      path = 'closed';
+    } else if (notStarted) {
+      // 未启动部分退款：订单继续有效，可正常排队启动
+      await c.query(`UPDATE orders SET pay_status='partial_refunded' WHERE id=$1`, [o.id]);
+      path = 'partial';
+    } else {
+      // 已启动/已完成/已终结：保留实际服务状态，仅结算支付标记，不释放在用设备
+      await c.query(`UPDATE orders SET pay_status=$1 WHERE id=$2`, [full ? 'refunded' : 'partial_refunded', o.id]);
+      path = 'settled';
     }
+    if (r.ticket_id) {
+      const resolution = {
+        closed: `退款 ${amountText} 已原路退回；订单已关闭，设备队列已释放/重排`,
+        partial: `部分退款 ${amountText} 已原路退回；订单继续有效`,
+        settled: `退款 ${amountText} 已原路退回；订单服务状态不变`,
+      }[path];
+      await c.query(`UPDATE tickets SET status='resolved', resolution=$1, updated_at=now() WHERE id=$2`, [resolution, r.ticket_id]);
+      await ticketEvent(c, r.ticket_id, req.user, 'refund', resolution);
+    }
+    return { path };
   });
-  await notify(r.user_id, 'refund', '退款到账', `订单退款 ¥${(r.amount_cents / 100).toFixed(2)} 已原路退回。`);
-  res.json({ ok: true });
+  if (result.error) return bad(res, result.error, result.code || 400);
+  const message = {
+    closed: `退款 ${amountText} 已原路退回，订单已关闭，设备队列已释放`,
+    partial: `部分退款 ${amountText} 已原路退回，订单继续有效`,
+    settled: `退款 ${amountText} 已原路退回，当前订单服务不受影响`,
+  }[result.path];
+  await notify(r.user_id, 'refund', result.path === 'partial' ? '部分退款到账' : '退款到账', `订单退款处理完成：${message}。`);
+  res.json({ ok: true, path: result.path, message });
 }));
 
 router.post('/refunds/:id/reject', auth, requireRole('service', 'property'), ah(async (req, res) => {
   const { note = '' } = req.body || {};
   const r = await one('SELECT * FROM refunds WHERE id=$1', [req.params.id]);
   if (!r) return bad(res, '退款单不存在', 404);
-  if (r.status !== 'requested') return bad(res, '该退款已处理');
-  await tx(async (c) => {
-    await c.query(`UPDATE refunds SET status='rejected', processed_by=$1, processed_at=now() WHERE id=$2`, [req.user.id, r.id]);
+  const done = await tx(async (c) => {
+    // 原子认领：重复/并发驳回只生效一次，避免重复通知
+    const claim = await c.query(
+      `UPDATE refunds SET status='rejected', processed_by=$1, processed_at=now() WHERE id=$2 AND status='requested' RETURNING id`,
+      [req.user.id, r.id]);
+    if (!claim.rows[0]) return false;
     if (r.ticket_id) await ticketEvent(c, r.ticket_id, req.user, 'reject', `退款驳回：${note}`);
+    return true;
   });
+  if (!done) return bad(res, '该退款已处理');
   await notify(r.user_id, 'refund', '退款未通过', `你的退款申请未通过${note ? '：' + note : ''}，如有异议可联系物业。`);
   res.json({ ok: true });
 }));

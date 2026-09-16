@@ -132,8 +132,19 @@ export async function queueOfDevice(deviceId) {
   );
 }
 
-/** 队列轮到时通知下一位 */
+/**
+ * 占用释放后重算设备队列（取衣/代收/取消/退款关闭订单后调用）：
+ * - 设备仍被进行中/待取订单占用 → 保持 running/finished，不提前通知下一位；
+ * - 设备空闲且队列有下一位 → 置 queued 并通知其启动；
+ * - 队列已空 → 置 idle。
+ * 故障/维修/离线设备不改动。
+ */
 export async function notifyNextInQueue(client, deviceId) {
+  const active = await client.query(
+    `SELECT id FROM orders WHERE device_id=$1 AND status IN ('running','finished') LIMIT 1`,
+    [deviceId]
+  );
+  if (active.rows[0]) return;
   const next = await client.query(
     `SELECT o.id, o.user_id, o.order_no, d.code AS device_code FROM orders o JOIN devices d ON d.id=o.device_id
      WHERE o.device_id=$1 AND o.status='paid' ORDER BY o.paid_at ASC LIMIT 1`,
@@ -141,9 +152,9 @@ export async function notifyNextInQueue(client, deviceId) {
   );
   if (next.rows[0]) {
     const n = next.rows[0];
-    await client.query('UPDATE devices SET status=$1 WHERE id=$2 AND status NOT IN ($3,$4,$5)', ['queued', deviceId, 'fault', 'maintenance', 'offline']);
+    await client.query(`UPDATE devices SET status='queued' WHERE id=$1 AND status NOT IN ('fault','maintenance','offline')`, [deviceId]);
     await notify(n.user_id, 'queue', '轮到你了', `设备 ${n.device_code} 已空闲，你的订单 ${n.order_no} 可以启动，请尽快前往。`);
   } else {
-    await client.query('UPDATE devices SET status=$1 WHERE id=$2 AND status NOT IN ($3,$4,$5)', ['idle', deviceId, 'fault', 'maintenance', 'offline']);
+    await client.query(`UPDATE devices SET status='idle' WHERE id=$1 AND status NOT IN ('fault','maintenance','offline')`, [deviceId]);
   }
 }

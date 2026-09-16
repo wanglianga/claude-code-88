@@ -48,6 +48,14 @@ export const ORDER_STATUS: Record<string, { label: string; cls: string }> = {
   expired: { label: '超时已代收', cls: 'st-fault' },
 };
 
+/** 订单状态展示：退款关闭的订单给出统一结论，避免「已退款」与「排队中」并存 */
+export function orderStatusLabel(o: { status: string; pay_status?: string }): { label: string; cls: string } {
+  if (o.status === 'cancelled' && (o.pay_status === 'refunded' || o.pay_status === 'partial_refunded')) {
+    return { label: '已退款·已关闭', cls: 'st-offline' };
+  }
+  return ORDER_STATUS[o.status] || { label: o.status, cls: 'st-offline' };
+}
+
 export const TICKET_STATUS: Record<string, { label: string; cls: string }> = {
   open: { label: '待处理', cls: 'st-fault' },
   assigned: { label: '已指派', cls: 'st-queued' },

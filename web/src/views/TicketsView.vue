@@ -103,8 +103,8 @@ async function close() {
 async function approveRefund() {
   if (!detail.value?.refund) return;
   try {
-    await api.post(`/api/refunds/${detail.value.refund.id}/approve`);
-    ok('退款已批准并原路退回');
+    const r = await api.post<{ message?: string }>(`/api/refunds/${detail.value.refund.id}/approve`);
+    ok(r.message || '退款已批准并原路退回');
     await openDetail(detail.value);
     await load();
   } catch (e: any) { err(e.message); }

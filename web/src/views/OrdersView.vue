@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue';
 import { api } from '../api';
 import type { Order } from '../types';
-import { ORDER_STATUS, PAY_STATUS, fen, fmtTime } from '../utils';
+import { PAY_STATUS, fen, fmtTime, orderStatusLabel } from '../utils';
 import { ok, err } from '../toast';
 import Modal from '../components/Modal.vue';
 
@@ -64,7 +64,7 @@ onMounted(load);
             </td>
             <td>{{ PAY_STATUS[o.pay_status] || o.pay_status }}</td>
             <td>
-              <span class="badge" :class="ORDER_STATUS[o.status]?.cls">{{ ORDER_STATUS[o.status]?.label || o.status }}</span>
+              <span class="badge" :class="orderStatusLabel(o).cls">{{ orderStatusLabel(o).label }}</span>
               <div v-if="o.overdue" class="badge st-fault" style="margin-top:3px">超时</div>
             </td>
             <td class="muted" style="font-size:12px">
