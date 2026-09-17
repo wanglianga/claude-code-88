@@ -24,6 +24,11 @@ export interface SiteRules {
   maxDailyOrdersPerUser?: number;
   occupationLimitMin?: number;
   minCreditToBook?: number;
+  smsGraceMin?: number;
+  proxyExtraWaitMin?: number;
+  storageHours?: number;
+  storageCabinets?: number;
+  storageRemindBeforeHours?: number;
   note?: string;
 }
 
@@ -116,3 +121,29 @@ export interface Quote {
 }
 
 export interface StaffUser { id: number; name: string; role: Role }
+
+/** 代取资格检查项 */
+export interface EligibilityCheck { key: string; label: string; ok: boolean; detail: string }
+
+/** 保洁任务台 - 超时订单（含代取资格） */
+export interface OverdueOrder {
+  id: number; order_no: string; mode_name: string; pickup_deadline: string;
+  user_id: number; device_id: number; site_id: number; user_name: string; device_code: string; site_name: string;
+  queue_count: number; sms_sent_at: string | null;
+  eligible: boolean; checks: EligibilityCheck[];
+}
+
+/** 代取记录 */
+export interface ProxyPickup {
+  id: number; pickup_no: string; bag_no: string; cabinet_no: string;
+  pickup_code?: string; storage_hours: number; store_until: string;
+  status: 'stored' | 'returned' | 'escalated' | 'disposed';
+  remind_sent?: boolean; note?: string;
+  collected_at: string; returned_at?: string; escalated_at?: string; disposed_at?: string;
+  photo_url?: string;
+  order_no?: string; mode_name?: string; device_code?: string; site_name?: string;
+  user_name?: string; cleaner_name?: string;
+}
+
+/** 保管柜 */
+export interface Cabinet { no: string; occupied: boolean; bag_no: string | null }

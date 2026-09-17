@@ -230,6 +230,45 @@ CREATE TABLE IF NOT EXISTS pickup_auths (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   used_at TIMESTAMPTZ
 );
+-- 超时未取 · 保洁代取记录（封袋保管 → 用户取回 / 逾期移交物业）
+CREATE TABLE IF NOT EXISTS proxy_pickups (
+  id SERIAL PRIMARY KEY,
+  pickup_no TEXT UNIQUE NOT NULL,
+  order_id INT NOT NULL REFERENCES orders(id),
+  user_id INT NOT NULL REFERENCES users(id),
+  device_id INT NOT NULL REFERENCES devices(id),
+  site_id INT NOT NULL REFERENCES sites(id),
+  cleaner_id INT NOT NULL REFERENCES users(id),
+  ticket_id INT REFERENCES tickets(id),
+  photo_url TEXT,
+  bag_no TEXT UNIQUE NOT NULL,
+  cabinet_no TEXT NOT NULL,
+  pickup_code TEXT NOT NULL,
+  storage_hours INT NOT NULL,
+  store_until TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'stored' CHECK (status IN ('stored','returned','escalated','disposed')),
+  remind_sent BOOLEAN NOT NULL DEFAULT false,
+  note TEXT,
+  collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  returned_at TIMESTAMPTZ,
+  escalated_at TIMESTAMPTZ,
+  disposed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_pickups_user ON proxy_pickups(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_proxy_pickups_site ON proxy_pickups(site_id, status);
+-- 模拟短信发送记录（代取资格判断依赖超时提醒短信的发送时间）
+CREATE TABLE IF NOT EXISTS sms_logs (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES users(id),
+  phone TEXT,
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  ref_type TEXT,
+  ref_id INT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sms_ref ON sms_logs(ref_type, ref_id);
 CREATE TABLE IF NOT EXISTS repairs (
   id SERIAL PRIMARY KEY,
   device_id INT NOT NULL REFERENCES devices(id),

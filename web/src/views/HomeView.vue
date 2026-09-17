@@ -307,8 +307,8 @@ onUnmounted(() => { clearInterval(tickTimer); clearInterval(pollTimer); });
 
       <!-- 待取衣 -->
       <div v-else-if="active.status === 'finished'" class="mt12">
-        <div v-if="pickupRemain" class="alert info">👕 洗涤完成！取衣倒计时 <b>{{ pickupRemain }}</b>，超时将扣减信用并由保洁代收</div>
-        <div v-else class="alert error">⚠️ 已超时 {{ pickupOverdue }}！信用已扣减，请立即取衣，逾期将由保洁代收存入遗留物柜</div>
+        <div v-if="pickupRemain" class="alert info">👕 洗涤完成！取衣倒计时 <b>{{ pickupRemain }}</b>，超时将扣减信用并短信提醒，保洁可能代取封存</div>
+        <div v-else class="alert error">⚠️ 已超时 {{ pickupOverdue }}！信用已扣减，提醒短信已发送至手机。请立即取衣；满足代取条件后保洁将拍照代取、封袋存柜，届时需凭取件码取回</div>
         <div class="row mt12">
           <button class="btn btn-green" @click="pickup">✅ 我已取衣</button>
           <button class="btn btn-outline" :disabled="!!active.pickup_auth" @click="authorizePickup">

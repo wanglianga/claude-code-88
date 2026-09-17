@@ -4,6 +4,7 @@ import { one, many, q, tx } from './db.js';
 import {
   auth, requireRole, signToken, genNo, notify, adjustCredit, ticketEvent,
   createTicket, calcPrice, inNightSilent, activeOrderOfDevice, queueOfDevice, notifyNextInQueue,
+  sendSms, proxyEligibility,
 } from './helpers.js';
 
 export const router = Router();
@@ -595,21 +596,110 @@ router.get('/restocks', auth, ah(async (req, res) => {
   res.json(rows);
 }));
 
-/** 保洁任务台：待补液设备 + 超时待收订单 + 代取授权 */
+/** 保洁任务台：待补液设备 + 超时待收订单（含代取资格判断） + 代取授权 */
 router.get('/cleaner/tasks', auth, requireRole('cleaner', 'property'), ah(async (req, res) => {
   const lowDevices = await many(
     `SELECT d.id, d.code, d.detergent_level, s.name AS site_name FROM devices d JOIN sites s ON s.id=d.site_id
      WHERE d.detergent_level < 30 AND d.status NOT IN ('offline') ORDER BY d.detergent_level`);
   const overdueOrders = await many(
-    `SELECT o.id, o.order_no, o.mode_name, o.pickup_deadline, o.user_id, u.name AS user_name, d.code AS device_code, s.name AS site_name
+    `SELECT o.id, o.order_no, o.mode_name, o.pickup_deadline, o.user_id, o.device_id, o.site_id, u.name AS user_name,
+            d.code AS device_code, s.name AS site_name, s.rules,
+            (SELECT COUNT(*)::int FROM orders q WHERE q.device_id=o.device_id AND q.status='paid') AS queue_count,
+            (SELECT MIN(sm.created_at) FROM sms_logs sm WHERE sm.ref_type='order' AND sm.ref_id=o.id AND sm.kind='timeout_warn') AS sms_sent_at
      FROM orders o JOIN users u ON u.id=o.user_id JOIN devices d ON d.id=o.device_id JOIN sites s ON s.id=o.site_id
      WHERE o.status='finished' AND o.overdue=true ORDER BY o.pickup_deadline`);
+  const now = new Date();
+  for (const o of overdueOrders) {
+    const { eligible, checks } = proxyEligibility(o, o.rules, o.queue_count, o.sms_sent_at, now);
+    o.eligible = eligible;
+    o.checks = checks;
+    delete o.rules;
+  }
   const auths = await many(
     `SELECT pa.id, pa.order_id, pa.created_at, o.order_no, u.name AS user_name, d.code AS device_code, s.name AS site_name
      FROM pickup_auths pa JOIN orders o ON o.id=pa.order_id JOIN users u ON u.id=pa.user_id
      JOIN devices d ON d.id=o.device_id JOIN sites s ON s.id=o.site_id
      WHERE pa.status='authorized' AND o.status='finished' ORDER BY pa.id`);
   res.json({ lowDevices, overdueOrders, auths });
+}));
+
+/** 门店保管柜占用情况（代取时选择柜号） */
+router.get('/sites/:id/cabinets', auth, ah(async (req, res) => {
+  const site = await one('SELECT * FROM sites WHERE id=$1', [req.params.id]);
+  if (!site) return bad(res, '门店不存在', 404);
+  const total = site.rules?.storageCabinets ?? 8;
+  const used = await many(
+    `SELECT cabinet_no, bag_no FROM proxy_pickups WHERE site_id=$1 AND status='stored'`, [site.id]);
+  const usedMap = Object.fromEntries(used.map((u) => [u.cabinet_no, u.bag_no]));
+  const cabinets = [];
+  for (let i = 1; i <= total; i++) {
+    const no = `A-${i}`;
+    cabinets.push({ no, occupied: !!usedMap[no], bag_no: usedMap[no] || null });
+  }
+  res.json({ site_id: site.id, storage_hours: site.rules?.storageHours ?? 72, cabinets });
+}));
+
+/**
+ * 保洁代取超时占机衣物：拍照 + 封袋 + 存放柜编号 + 保洁确认，四要素齐备才允许提交。
+ * 同事务：订单关闭(expired) → 生成代取记录(用户确认任务) → 释放设备/重排队列 → 解决超时工单 → 短信+通知用户。
+ */
+router.post('/orders/:id/proxy-pickup', auth, requireRole('cleaner', 'property'), ah(async (req, res) => {
+  const { photo = '', cabinet_no, confirm = false, note = '' } = req.body || {};
+  const o = await one(
+    `SELECT o.*, d.code AS device_code, s.rules, s.name AS site_name FROM orders o
+     JOIN devices d ON d.id=o.device_id JOIN sites s ON s.id=o.site_id WHERE o.id=$1`, [req.params.id]);
+  if (!o) return bad(res, '订单不存在', 404);
+  if (o.status !== 'finished' || !o.overdue) return bad(res, '订单不在超时待取状态，不能代取');
+  if (!photo) return bad(res, '请先拍照留证（衣物出机照片）');
+  if (photo.length > 800 * 1024) return bad(res, '照片过大，请重新拍摄');
+  if (!cabinet_no) return bad(res, '请选择存放柜编号');
+  if (!confirm) return bad(res, '请保洁本人确认「已核对衣物并封袋」');
+
+  // 服务端复核代取资格（倒计时 / 短信 / 排队人数）
+  const queueCount = (await one(`SELECT COUNT(*)::int AS c FROM orders WHERE device_id=$1 AND status='paid'`, [o.device_id])).c;
+  const sms = await one(`SELECT MIN(created_at) AS t FROM sms_logs WHERE ref_type='order' AND ref_id=$1 AND kind='timeout_warn'`, [o.id]);
+  const { eligible, checks } = proxyEligibility(o, o.rules, queueCount, sms?.t || null);
+  if (!eligible) {
+    return bad(res, '暂不允许代取：' + checks.filter((c) => !c.ok).map((c) => c.label).join('；'), 403);
+  }
+
+  const storageHours = o.rules?.storageHours ?? 72;
+  const pickupNo = genNo('PX');
+  const bagNo = genNo('BAG');
+  const pickupCode = String(Math.floor(100000 + Math.random() * 900000));
+
+  const result = await tx(async (c) => {
+    // 原子认领订单，防止并发重复代取
+    const claim = await c.query(
+      `UPDATE orders SET status='expired', closed_at=now() WHERE id=$1 AND status='finished' RETURNING id`, [o.id]);
+    if (!claim.rows[0]) return { error: '订单状态已变化，请刷新后重试' };
+    // 柜号占用校验（同事务内）
+    const occupied = await c.query(`SELECT id FROM proxy_pickups WHERE site_id=$1 AND cabinet_no=$2 AND status='stored'`, [o.site_id, cabinet_no]);
+    if (occupied.rows[0]) return { error: `柜号 ${cabinet_no} 已被占用，请选择其他柜` };
+    const t = await c.query(
+      `SELECT id FROM tickets WHERE order_id=$1 AND type='timeout_no_pickup' AND status IN ('open','assigned','processing')`, [o.id]);
+    const r = await c.query(
+      `INSERT INTO proxy_pickups(pickup_no, order_id, user_id, device_id, site_id, cleaner_id, ticket_id, photo_url, bag_no, cabinet_no, pickup_code, storage_hours, store_until, note)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now()+($13 || ' hours')::interval, $14) RETURNING *`,
+      [pickupNo, o.id, o.user_id, o.device_id, o.site_id, req.user.id, t.rows[0]?.id || null,
+       photo, bagNo, cabinet_no, pickupCode, storageHours, String(storageHours), note || null]);
+    await notifyNextInQueue(c, o.device_id);
+    if (t.rows[0]) {
+      await c.query(`UPDATE tickets SET status='resolved', resolution=$2, updated_at=now() WHERE id=$1`,
+        [t.rows[0].id, `保洁代取：拍照留证、封袋 ${bagNo}、存入 ${cabinet_no} 柜，设备已释放`]);
+      await ticketEvent(c, t.rows[0].id, req.user, 'proxy_pickup', `代取完成：封袋 ${bagNo} → ${cabinet_no} 柜`);
+    }
+    return { pickup: r.rows[0] };
+  });
+  if (result.error) return bad(res, result.error);
+
+  const p = result.pickup;
+  await sendSms(o.user_id, 'proxy_collected',
+    `【净邻洗衣】您在 ${o.device_code} 的衣物超时未取，保洁已代取封存。封袋号 ${bagNo}，存放柜 ${cabinet_no}，取件码 ${pickupCode}，保管 ${storageHours} 小时，逾期将移交物业处理。`,
+    'proxy_pickup', p.id);
+  await notify(o.user_id, 'proxy', '衣物已由保洁代取封存',
+    `你在设备 ${o.device_code} 的衣物超时占机，已由保洁拍照代取。封袋编号 ${bagNo}，存放柜 ${cabinet_no}，取件码 ${pickupCode}。请在 ${storageHours} 小时内到「我的-代取任务」核对取回，逾期将移交物业。`);
+  res.json({ ok: true, pickup: { id: p.id, pickup_no: p.pickup_no, bag_no: bagNo, cabinet_no, pickup_code: pickupCode, store_until: p.store_until } });
 }));
 
 /** 保洁代收超时衣物 → 遗留物入库，释放设备 */
@@ -649,6 +739,85 @@ router.post('/pickup-auths/:id/use', auth, requireRole('cleaner', 'property'), a
     await notifyNextInQueue(c, o.device_id);
   });
   await notify(o.user_id, 'collect', '保洁已代取衣物', `你授权代取的衣物已存入遗留物保管柜，请在「我的-遗留物」中认领。`);
+  res.json({ ok: true });
+}));
+
+/* ================= 代取保管（用户确认任务 / 取回 / 物业处置） ================= */
+/** 我的代取任务（居民）：待确认取回 + 历史记录 */
+router.get('/proxy-pickups/mine', auth, ah(async (req, res) => {
+  const rows = await many(
+    `SELECT p.id, p.pickup_no, p.bag_no, p.cabinet_no, p.pickup_code, p.storage_hours, p.store_until, p.status,
+            p.collected_at, p.returned_at, p.escalated_at, p.photo_url,
+            o.order_no, o.mode_name, d.code AS device_code, s.name AS site_name, cu.name AS cleaner_name
+     FROM proxy_pickups p
+     JOIN orders o ON o.id=p.order_id JOIN devices d ON d.id=p.device_id JOIN sites s ON s.id=p.site_id
+     JOIN users cu ON cu.id=p.cleaner_id
+     WHERE p.user_id=$1 ORDER BY p.id DESC LIMIT 30`, [req.user.id]);
+  res.json(rows);
+}));
+
+/** 代取管理列表（保洁/物业） */
+router.get('/proxy-pickups', auth, requireRole('cleaner', 'property', 'service'), ah(async (req, res) => {
+  const { status } = req.query;
+  const params = [];
+  let where = '1=1';
+  if (status && status !== 'all') { params.push(status); where = `p.status=$${params.length}`; }
+  const rows = await many(
+    `SELECT p.id, p.pickup_no, p.bag_no, p.cabinet_no, p.storage_hours, p.store_until, p.status, p.remind_sent,
+            p.collected_at, p.returned_at, p.escalated_at, p.disposed_at, p.photo_url, p.note,
+            o.order_no, u.name AS user_name, d.code AS device_code, s.name AS site_name, cu.name AS cleaner_name
+     FROM proxy_pickups p
+     JOIN orders o ON o.id=p.order_id JOIN users u ON u.id=p.user_id
+     JOIN devices d ON d.id=p.device_id JOIN sites s ON s.id=p.site_id
+     JOIN users cu ON cu.id=p.cleaner_id
+     WHERE ${where} ORDER BY CASE p.status WHEN 'stored' THEN 0 WHEN 'escalated' THEN 1 ELSE 2 END, p.id DESC LIMIT 100`, params);
+  res.json(rows);
+}));
+
+/**
+ * 用户取回确认：核对封袋编号 + 扫码（取件码）双重校验，任一不符即拒绝。
+ */
+router.post('/proxy-pickups/:id/confirm-return', auth, requireRole('resident'), ah(async (req, res) => {
+  const { bag_no, pickup_code } = req.body || {};
+  const p = await one('SELECT * FROM proxy_pickups WHERE id=$1', [req.params.id]);
+  if (!p || p.user_id !== req.user.id) return bad(res, '代取记录不存在', 404);
+  if (p.status !== 'stored') return bad(res, '该任务已处理，无需重复确认');
+  if (!bag_no || !pickup_code) return bad(res, '请填写封袋编号并扫码（输入取件码）');
+  if (String(bag_no).trim().toUpperCase() !== p.bag_no.toUpperCase()) {
+    return bad(res, `封袋编号核对不符（袋面编号应为 ${p.bag_no}），请确认是否拿错袋子`);
+  }
+  if (String(pickup_code).trim() !== p.pickup_code) {
+    return bad(res, '取件码不正确，请扫描柜面二维码或核对短信中的取件码');
+  }
+  await tx(async (c) => {
+    const done = await c.query(
+      `UPDATE proxy_pickups SET status='returned', returned_at=now() WHERE id=$1 AND status='stored' RETURNING id`, [p.id]);
+    if (!done.rows[0]) throw new Error('该任务已被处理');
+    await adjustCredit(c, p.user_id, 1, '代取衣物按时取回，信用恢复', 'proxy_pickup', p.id);
+  });
+  await notify(p.user_id, 'proxy', '衣物取回确认成功', `封袋 ${p.bag_no}（${p.cabinet_no} 柜）已核对取回，感谢配合。`);
+  res.json({ ok: true, message: '封袋编号与取件码核对一致，取回完成' });
+}));
+
+/** 物业处置逾期代取衣物（联动遗留物记录一并处理） */
+router.post('/proxy-pickups/:id/dispose', auth, requireRole('property'), ah(async (req, res) => {
+  const { note = '' } = req.body || {};
+  const p = await one('SELECT * FROM proxy_pickups WHERE id=$1', [req.params.id]);
+  if (!p) return bad(res, '代取记录不存在', 404);
+  if (p.status !== 'escalated') return bad(res, '仅「逾期移交物业」的代取单可处置');
+  await tx(async (c) => {
+    await c.query(`UPDATE proxy_pickups SET status='disposed', disposed_at=now() WHERE id=$1`, [p.id]);
+    await c.query(`UPDATE lost_items SET status='disposed' WHERE order_id=$1 AND status='stored'`, [p.order_id]);
+    const t = await c.query(
+      `SELECT id FROM tickets WHERE type='lost_escalation' AND status IN ('open','assigned','processing')
+       AND description LIKE '%' || $1 || '%'`, [p.bag_no]);
+    if (t.rows[0]) {
+      await c.query(`UPDATE tickets SET status='resolved', resolution=$2, updated_at=now() WHERE id=$1`,
+        [t.rows[0].id, `物业处置逾期代取衣物（封袋 ${p.bag_no}）${note ? '：' + note : ''}`]);
+      await ticketEvent(c, t.rows[0].id, req.user, 'dispose', `逾期衣物已处置${note ? '：' + note : ''}`);
+    }
+  });
+  await notify(p.user_id, 'proxy', '逾期衣物已由物业处置', `封袋 ${p.bag_no} 超过保管期限未取回，物业已按遗留物规定处置${note ? '：' + note : ''}。`);
   res.json({ ok: true });
 }));
 
@@ -856,7 +1025,7 @@ router.get('/archives', auth, requireRole('property', 'service'), ah(async (req,
   const siteId = req.query.site_id ? Number(req.query.site_id) : null;
   const p = siteId ? [siteId] : [];
   const w = (col) => (siteId ? `WHERE ${col}=$1` : '');
-  const [refunds, repairs, wrongPickups, lostItems, credits] = await Promise.all([
+  const [refunds, repairs, wrongPickups, lostItems, credits, proxyPickups] = await Promise.all([
     many(`SELECT r.*, o.order_no, u.name AS user_name, d.code AS device_code FROM refunds r
           JOIN orders o ON o.id=r.order_id JOIN users u ON u.id=r.user_id JOIN devices d ON d.id=o.device_id
           ${siteId ? 'WHERE o.site_id=$1' : ''} ORDER BY r.id DESC LIMIT 50`, p),
@@ -871,8 +1040,13 @@ router.get('/archives', auth, requireRole('property', 'service'), ah(async (req,
           ${w('l.site_id')} ORDER BY l.id DESC LIMIT 50`, p),
     many(`SELECT c.*, u.name AS user_name FROM credit_records c JOIN users u ON u.id=c.user_id
           ORDER BY c.id DESC LIMIT 80`, []),
+    many(`SELECT p.id, p.pickup_no, p.bag_no, p.cabinet_no, p.status, p.store_until, p.collected_at, p.returned_at, p.escalated_at,
+                 o.order_no, u.name AS user_name, d.code AS device_code, cu.name AS cleaner_name
+          FROM proxy_pickups p JOIN orders o ON o.id=p.order_id JOIN users u ON u.id=p.user_id
+          JOIN devices d ON d.id=p.device_id JOIN users cu ON cu.id=p.cleaner_id
+          ${siteId ? 'WHERE p.site_id=$1' : ''} ORDER BY p.id DESC LIMIT 50`, p),
   ]);
-  res.json({ refunds, repairs, wrongPickups, lostItems, credits });
+  res.json({ refunds, repairs, wrongPickups, lostItems, credits, proxyPickups });
 }));
 
 router.get('/users', auth, requireRole('property', 'service'), ah(async (req, res) => {

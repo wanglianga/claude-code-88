@@ -263,3 +263,24 @@ p { margin: 0; }
 .notif-item.unread .t { font-weight: 800; }
 .notif-item .t { font-size: 13.5px; }
 .notif-item .b { color: var(--ink-2); font-size: 12.5px; margin-top: 2px; }
+
+/* ---------- 代取资格检查清单 ---------- */
+.check-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.check-item {
+  font-size: 11.5px; padding: 2px 9px; border-radius: 999px; font-weight: 600;
+  background: var(--red-soft); color: var(--red); cursor: default;
+}
+.check-item.ok { background: var(--green-soft); color: var(--green); }
+
+/* ---------- 代取任务卡（用户端） ---------- */
+.proxy-card {
+  border: 1.5px solid var(--line); border-radius: 12px; padding: 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.proxy-card.pending { border-color: var(--purple); background: var(--purple-soft); }
+.proxy-line { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-2); }
+.proxy-line b { color: var(--ink); }
+.pickup-code {
+  font-size: 26px; font-weight: 800; letter-spacing: 6px; text-align: center;
+  background: #fff; border: 1.5px dashed var(--line); border-radius: 10px; padding: 8px 0;
+}

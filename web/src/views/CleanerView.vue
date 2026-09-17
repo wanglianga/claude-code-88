@@ -1,21 +1,27 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { api } from '../api';
-import type { Inspection, LostItem, Site } from '../types';
-import { fen, fmtTime, LOST_STATUS } from '../utils';
+import { useAuthStore } from '../stores/auth';
+import type { Cabinet, Inspection, LostItem, OverdueOrder, ProxyPickup, Site } from '../types';
+import { fen, fmtTime, remainText, overdueText, LOST_STATUS, PROXY_STATUS } from '../utils';
 import { ok, err } from '../toast';
+import Modal from '../components/Modal.vue';
 
 interface Tasks {
   lowDevices: { id: number; code: string; detergent_level: number; site_name: string }[];
-  overdueOrders: { id: number; order_no: string; user_name: string; device_code: string; site_name: string; pickup_deadline: string }[];
+  overdueOrders: OverdueOrder[];
   auths: { id: number; order_id: number; order_no: string; user_name: string; device_code: string; site_name: string }[];
 }
 
+const auth = useAuthStore();
 const sites = ref<Site[]>([]);
 const tasks = ref<Tasks>({ lowDevices: [], overdueOrders: [], auths: [] });
 const inspections = ref<Inspection[]>([]);
 const restocks = ref<any[]>([]);
 const lostItems = ref<LostItem[]>([]);
+const proxyPickups = ref<ProxyPickup[]>([]);
+const now = ref(Date.now());
+let tickTimer: number | undefined;
 
 // 巡检表单
 const form = ref({
@@ -35,19 +41,35 @@ const OPTS_LEFT = ['无', '有遗留'];
 // 补货表单
 const restockForm = ref({ site_id: 0, item: '洗衣液', quantity: 10, note: '' });
 
+// 代取弹窗
+const pickupOrder = ref<OverdueOrder | null>(null);
+const pickupPhoto = ref('');
+const pickupCabinets = ref<Cabinet[]>([]);
+const pickupCabinet = ref('');
+const pickupConfirm = ref(false);
+const pickupNote = ref('');
+const pickupStorageHours = ref(72);
+const submitting = ref(false);
+
+const canSubmitPickup = computed(
+  () => !!pickupPhoto.value && !!pickupCabinet.value && pickupConfirm.value && !submitting.value
+);
+
 async function load() {
-  const [s, t, i, r, l] = await Promise.all([
+  const [s, t, i, r, l, p] = await Promise.all([
     api.get<Site[]>('/api/sites'),
     api.get<Tasks>('/api/cleaner/tasks'),
     api.get<Inspection[]>('/api/inspections'),
     api.get<any[]>('/api/restocks'),
     api.get<LostItem[]>('/api/lost-items'),
+    api.get<ProxyPickup[]>('/api/proxy-pickups'),
   ]);
   sites.value = s;
   tasks.value = t;
   inspections.value = i;
   restocks.value = r;
   lostItems.value = l;
+  proxyPickups.value = p;
   if (!form.value.site_id && s.length) form.value.site_id = s[0].id;
   if (!restockForm.value.site_id && s.length) restockForm.value.site_id = s[0].id;
 }
@@ -78,11 +100,77 @@ async function refillDevice(d: { id: number; code: string; site_name: string }) 
   } catch (e: any) { err(e.message); }
 }
 
-async function collect(o: { id: number; order_no: string }) {
-  const description = prompt('代收物品描述', '遗留衣物一袋') || '遗留衣物一袋';
+/* ---------- 代取 ---------- */
+async function openProxyPickup(o: OverdueOrder) {
+  pickupOrder.value = o;
+  pickupPhoto.value = '';
+  pickupCabinet.value = '';
+  pickupConfirm.value = false;
+  pickupNote.value = '';
   try {
-    await api.post(`/api/orders/${o.id}/collect-overtime`, { description });
-    ok('已代收并存入遗留物柜，设备已释放');
+    const r = await api.get<{ storage_hours: number; cabinets: Cabinet[] }>(`/api/sites/${o.site_id}/cabinets`);
+    pickupCabinets.value = r.cabinets;
+    pickupStorageHours.value = r.storage_hours;
+    const firstFree = r.cabinets.find((c) => !c.occupied);
+    pickupCabinet.value = firstFree?.no || '';
+  } catch (e: any) { err(e.message); }
+}
+
+/** 拍照上传：压缩为 ≤320px JPEG dataURL */
+function onPhotoChange(ev: Event) {
+  const file = (ev.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 320 / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+      pickupPhoto.value = canvas.toDataURL('image/jpeg', 0.7);
+    };
+    img.src = String(reader.result);
+  };
+  reader.readAsDataURL(file);
+}
+
+/** 模拟拍照：生成带设备编号与时间的占位照片 */
+function simulatePhoto() {
+  if (!pickupOrder.value) return;
+  const o = pickupOrder.value;
+  const ts = new Date().toLocaleString('zh-CN');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200">
+    <rect width="320" height="200" fill="#3b4252"/>
+    <rect x="16" y="16" width="288" height="168" rx="8" fill="#eceff4"/>
+    <text x="160" y="80" font-size="22" text-anchor="middle" fill="#2e3440">📷 衣物出机留证</text>
+    <text x="160" y="115" font-size="16" text-anchor="middle" fill="#4c566a">设备 ${o.device_code} · ${o.order_no}</text>
+    <text x="160" y="142" font-size="13" text-anchor="middle" fill="#4c566a">${ts}</text>
+  </svg>`;
+  pickupPhoto.value = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
+}
+
+async function submitProxyPickup() {
+  if (!pickupOrder.value || !canSubmitPickup.value) return;
+  submitting.value = true;
+  try {
+    const r = await api.post<{ bag_no: string; cabinet_no: string; pickup_code: string }>(
+      `/api/orders/${pickupOrder.value.id}/proxy-pickup`,
+      { photo: pickupPhoto.value, cabinet_no: pickupCabinet.value, confirm: pickupConfirm.value, note: pickupNote.value }
+    );
+    ok(`代取完成：封袋 ${r.bag_no} 已存 ${r.cabinet_no} 柜，取件码 ${r.pickup_code}，设备已释放`);
+    pickupOrder.value = null;
+    await load();
+  } catch (e: any) { err(e.message); }
+  finally { submitting.value = false; }
+}
+
+async function disposePickup(p: ProxyPickup) {
+  const note = prompt(`处置逾期衣物（封袋 ${p.bag_no}）备注`, '超过保管期限，按无主遗留物处理') || '';
+  try {
+    await api.post(`/api/proxy-pickups/${p.id}/dispose`, { note });
+    ok('已按遗留物规定处置');
     await load();
   } catch (e: any) { err(e.message); }
 }
@@ -111,7 +199,13 @@ async function disposeItem(l: LostItem) {
   } catch (e: any) { err(e.message); }
 }
 
-onMounted(load);
+const storeRemain = (p: ProxyPickup) => remainText(p.store_until, now.value) || '已到期';
+
+onMounted(() => {
+  load();
+  tickTimer = window.setInterval(() => { now.value = Date.now(); }, 30000);
+});
+onUnmounted(() => clearInterval(tickTimer));
 </script>
 
 <template>
@@ -132,13 +226,23 @@ onMounted(load);
       </div>
 
       <div class="card">
-        <div class="card-title">⏰ 超时未取待代收</div>
+        <div class="card-title">⏰ 超时未取 · 占机代取 <span class="sub">按倒计时 / 短信提醒 / 排队人数判定</span></div>
         <div v-if="tasks.overdueOrders.length">
-          <div v-for="o in tasks.overdueOrders" :key="o.id" class="spread" style="padding:7px 0;border-bottom:1px solid var(--line)">
-            <span><b>{{ o.device_code }}</b> · {{ o.user_name }}<br />
-              <span class="muted">{{ o.order_no }} · 宽限于 {{ fmtTime(o.pickup_deadline) }}</span>
-            </span>
-            <button class="btn btn-red btn-sm" @click="collect(o)">代收</button>
+          <div v-for="o in tasks.overdueOrders" :key="o.id" style="padding:9px 0;border-bottom:1px solid var(--line)">
+            <div class="spread">
+              <span><b>{{ o.device_code }}</b> · {{ o.user_name }}<br />
+                <span class="muted">{{ o.order_no }} · 宽限于 {{ fmtTime(o.pickup_deadline) }}</span>
+              </span>
+              <button class="btn btn-sm" :class="o.eligible ? 'btn-red' : 'btn-ghost'" :disabled="!o.eligible"
+                      @click="openProxyPickup(o)">
+                {{ o.eligible ? '代取封存' : '暂不可代取' }}
+              </button>
+            </div>
+            <div class="check-list">
+              <span v-for="c in o.checks" :key="c.key" class="check-item" :class="{ ok: c.ok }" :title="c.detail">
+                {{ c.ok ? '✓' : '✗' }} {{ c.label }}
+              </span>
+            </div>
           </div>
         </div>
         <div v-else class="empty">暂无超时订单</div>
@@ -154,6 +258,39 @@ onMounted(load);
         </div>
         <div v-else class="empty">暂无代取授权</div>
       </div>
+    </div>
+
+    <!-- 代取保管 -->
+    <div class="card mt16">
+      <div class="card-title">🛅 代取衣物保管 <span class="sub">封袋编号 / 柜号 / 保管期限，逾期移交物业</span></div>
+      <table class="table" v-if="proxyPickups.length">
+        <thead><tr><th>封袋编号</th><th>用户 / 订单</th><th>柜号</th><th>照片</th><th>保管截止</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="p in proxyPickups" :key="p.id">
+            <td style="font-weight:700">{{ p.bag_no }}<br /><span class="muted" style="font-weight:400">{{ p.pickup_no }}</span></td>
+            <td>{{ p.user_name }}<br /><span class="muted">{{ p.order_no }} · {{ p.device_code }}</span></td>
+            <td><span class="badge soft">{{ p.cabinet_no }}</span></td>
+            <td>
+              <img v-if="p.photo_url" :src="p.photo_url" style="width:44px;height:32px;object-fit:cover;border-radius:6px;border:1px solid var(--line)" />
+              <span v-else class="muted">—</span>
+            </td>
+            <td>
+              <template v-if="p.status === 'stored'">
+                <span :style="{ color: storeRemain(p) === '已到期' ? 'var(--red)' : 'inherit', fontWeight: 700 }">{{ storeRemain(p) }}</span>
+                <br /><span class="muted">{{ fmtTime(p.store_until) }}</span>
+              </template>
+              <span v-else class="muted">{{ fmtTime(p.store_until) }}</span>
+            </td>
+            <td><span class="badge" :class="PROXY_STATUS[p.status]?.cls">{{ PROXY_STATUS[p.status]?.label }}</span></td>
+            <td>
+              <button v-if="p.status === 'escalated' && auth.user?.role === 'property'"
+                      class="btn btn-red btn-sm" @click="disposePickup(p)">物业处置</button>
+              <span v-else class="muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else class="empty">暂无代取记录</div>
     </div>
 
     <!-- 巡检登记 -->
@@ -287,5 +424,57 @@ onMounted(load);
       </table>
       <div v-else class="empty">暂无补货记录</div>
     </div>
+
+    <!-- 代取弹窗：拍照 + 封袋 + 柜号 + 保洁确认 -->
+    <Modal v-if="pickupOrder" :title="`代取封存 · ${pickupOrder.device_code} · ${pickupOrder.order_no}`" @close="pickupOrder = null">
+      <div class="alert warn">
+        用户 {{ pickupOrder.user_name }} 超时未取，请完成以下四步：拍照留证 → 系统生成封袋编号 → 选择存放柜 → 本人确认。
+        保管期限 {{ pickupStorageHours }} 小时，逾期将移交物业。
+      </div>
+
+      <div class="field">
+        <label>① 拍照留证（衣物出机照片）</label>
+        <div class="row">
+          <input class="input" type="file" accept="image/*" @change="onPhotoChange" />
+          <button class="btn btn-outline btn-sm" @click="simulatePhoto">📷 模拟拍照</button>
+        </div>
+        <div v-if="pickupPhoto" class="mt8">
+          <img :src="pickupPhoto" style="max-width:100%;max-height:150px;border-radius:8px;border:1px solid var(--line)" />
+        </div>
+        <div v-else class="muted mt8">未拍照不可提交</div>
+      </div>
+
+      <div class="form-row">
+        <div class="field">
+          <label>② 封袋编号（提交时系统生成并打印）</label>
+          <input class="input" value="提交后自动生成，如 BAG20260917…" disabled />
+        </div>
+        <div class="field">
+          <label>③ 存放柜编号</label>
+          <select class="select" v-model="pickupCabinet">
+            <option value="" disabled>请选择柜号</option>
+            <option v-for="c in pickupCabinets" :key="c.no" :value="c.no" :disabled="c.occupied">
+              {{ c.no }} {{ c.occupied ? `（占用中 ${c.bag_no}）` : '（空闲）' }}
+            </option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>衣物备注（可选）</label>
+        <input class="input" v-model="pickupNote" placeholder="如：外套两件、牛仔裤一条" />
+      </div>
+
+      <div class="field">
+        <label class="row" style="gap:8px;align-items:flex-start;cursor:pointer">
+          <input type="checkbox" v-model="pickupConfirm" style="margin-top:3px" />
+          <span>④ 保洁确认：本人已现场核对衣物、拍照留证并封袋贴标，衣物与订单 {{ pickupOrder.order_no }} 一致</span>
+        </label>
+      </div>
+
+      <button class="btn btn-red btn-block" :disabled="!canSubmitPickup" @click="submitProxyPickup">
+        {{ submitting ? '提交中…' : '确认代取封存（释放设备）' }}
+      </button>
+    </Modal>
   </div>
 </template>

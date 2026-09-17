@@ -1,13 +1,14 @@
 import { q, tx, one } from './db.js';
-import { notify, adjustCredit, createTicket, ticketEvent, notifyNextInQueue } from './helpers.js';
+import { notify, adjustCredit, createTicket, ticketEvent, notifyNextInQueue, sendSms } from './helpers.js';
 
 /**
  * 周期任务：保持「用户占用 / 设备状态 / 物业处理」一致
  * 1. 未支付预约 10 分钟自动取消
  * 2. 运行中订单到点自动完成（等价于设备 IoT 回调）
  * 3. 结束前 5 分钟取衣提醒
- * 4. 超时未取 → 标记逾期、扣信用、生成保洁工单
- * 5. 设备状态一致性校正
+ * 4. 超时未取 → 标记逾期、扣信用、发短信提醒、生成保洁工单
+ * 5. 代取保管：到期前提醒用户，逾期移交物业并进入遗留物流程
+ * 6. 设备状态一致性校正
  */
 export function startJobs() {
   const tick = async () => {
@@ -55,7 +56,8 @@ async function sweep() {
 
   // 4. 超时未取
   const overdue = await q(
-    `SELECT o.*, d.code AS device_code FROM orders o JOIN devices d ON d.id=o.device_id
+    `SELECT o.*, d.code AS device_code, u.phone AS user_phone FROM orders o
+     JOIN devices d ON d.id=o.device_id JOIN users u ON u.id=o.user_id
      WHERE o.status='finished' AND o.overdue=false AND o.pickup_deadline < now()`);
   for (const o of overdue.rows) {
     await tx(async (c) => {
@@ -72,7 +74,56 @@ async function sweep() {
         await ticketEvent(c, t.id, null, 'system', '系统自动生成超时工单');
       }
     });
-    await notify(o.user_id, 'overdue', '取衣已超时', `订单 ${o.order_no} 已超过取衣宽限，信用 -5。请尽快取衣，超时过久将由保洁代收。`);
+    // 短信提醒（代取资格判断以该短信发送时间为准）
+    await sendSms(o.user_id, 'timeout_warn',
+      `【净邻洗衣】您的订单 ${o.order_no}（设备 ${o.device_code}）已超过取衣宽限，信用 -5。请立即取衣，超时过久保洁将代取封存并移交保管柜。`,
+      'order', o.id);
+    await notify(o.user_id, 'overdue', '取衣已超时（短信已提醒）', `订单 ${o.order_no} 已超过取衣宽限，信用 -5，提醒短信已发送至 ${o.user_phone}。请尽快取衣，超时过久将由保洁代取封存。`);
+  }
+
+  // 5a. 代取保管到期前提醒（保管期限会提示用户）
+  const expiring = await q(
+    `SELECT p.*, s.rules FROM proxy_pickups p JOIN sites s ON s.id=p.site_id
+     WHERE p.status='stored' AND p.remind_sent=false
+       AND p.store_until <= now() + (COALESCE((s.rules->>'storageRemindBeforeHours')::int, 24) || ' hours')::interval
+       AND p.store_until > now()`);
+  for (const p of expiring.rows) {
+    await q('UPDATE proxy_pickups SET remind_sent=true WHERE id=$1', [p.id]);
+    const hoursLeft = Math.max(1, Math.round((new Date(p.store_until) - Date.now()) / 3600000));
+    await sendSms(p.user_id, 'storage_expiring',
+      `【净邻洗衣】您的代取衣物（封袋 ${p.bag_no}，${p.cabinet_no} 柜）保管期限仅剩约 ${hoursLeft} 小时，请尽快凭取件码取回，逾期将移交物业处理。`,
+      'proxy_pickup', p.id);
+    await notify(p.user_id, 'proxy', '保管期限将至，请尽快取回',
+      `封袋 ${p.bag_no}（${p.cabinet_no} 柜）保管期限仅剩约 ${hoursLeft} 小时。请在「我的-代取任务」核对封袋编号并扫码取回，逾期将移交物业进入遗留物流程。`);
+  }
+
+  // 5b. 代取保管逾期 → 移交物业，进入遗留物流程
+  const expiredPickups = await q(
+    `SELECT p.*, d.code AS device_code FROM proxy_pickups p JOIN devices d ON d.id=p.device_id
+     WHERE p.status='stored' AND p.store_until <= now()`);
+  for (const p of expiredPickups.rows) {
+    await tx(async (c) => {
+      const done = await c.query(
+        `UPDATE proxy_pickups SET status='escalated', escalated_at=now() WHERE id=$1 AND status='stored' RETURNING id`, [p.id]);
+      if (!done.rows[0]) return;
+      // 进入遗留物流程：生成遗留物档案（物业保管）
+      await c.query(
+        `INSERT INTO lost_items(site_id, device_id, order_id, description, found_by, keeper) VALUES($1,$2,$3,$4,$5,'物业保管柜')`,
+        [p.site_id, p.device_id, p.order_id, `代取逾期衣物（封袋 ${p.bag_no}，原存 ${p.cabinet_no} 柜）`, p.cleaner_id]);
+      // 生成物业处理工单
+      const t = await createTicket(c, {
+        type: 'lost_escalation', orderId: p.order_id, deviceId: p.device_id, siteId: p.site_id,
+        title: `代取衣物逾期移交物业 · 封袋 ${p.bag_no}`,
+        description: `代取单 ${p.pickup_no}（封袋 ${p.bag_no}，柜号 ${p.cabinet_no}）保管 ${p.storage_hours} 小时期满用户未取回，衣物已转入物业保管柜，请物业按遗留物规定处理。`,
+        priority: 'normal', assignedRole: 'property',
+      });
+      await ticketEvent(c, t.id, null, 'system', '保管期满，系统自动移交物业');
+    });
+    await sendSms(p.user_id, 'escalated',
+      `【净邻洗衣】您的代取衣物（封袋 ${p.bag_no}）已超过保管期限，现已移交物业按遗留物处理，请在「我的-遗留物」申请认领。`,
+      'proxy_pickup', p.id);
+    await notify(p.user_id, 'proxy', '保管已逾期，衣物移交物业',
+      `封袋 ${p.bag_no} 超过 ${p.storage_hours} 小时保管期限未取回，已移交物业进入遗留物流程。请在「我的-遗留物」申请认领，由物业核实后交接。`);
   }
 
   // 5. 设备状态一致性校正（故障/维修/离线不干预）

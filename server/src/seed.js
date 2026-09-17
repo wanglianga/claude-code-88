@@ -11,6 +11,7 @@ export async function seedIfEmpty() {
     ['resident1', '张伟', 'resident', '13800000001', 100],
     ['resident2', '李娜', 'resident', '13800000002', 96],
     ['resident3', '王强', 'resident', '13800000003', 55],
+    ['resident4', '陈静', 'resident', '13800000004', 90],
     ['service1', '王客服', 'service', '13800000011', 100],
     ['cleaner1', '刘保洁', 'cleaner', '13800000012', 100],
     ['repair1', '赵维修', 'maintenance', '13800000013', 100],
@@ -43,6 +44,11 @@ export async function seedIfEmpty() {
     maxDailyOrdersPerUser: 4,
     occupationLimitMin: 180,
     minCreditToBook: 60,
+    smsGraceMin: 10,
+    proxyExtraWaitMin: 30,
+    storageHours: 72,
+    storageCabinets: 8,
+    storageRemindBeforeHours: 24,
     note: '学生宿舍：夜间静音、晚高峰人多，鼓励早间错峰',
   };
   const aptRules = {
@@ -54,6 +60,11 @@ export async function seedIfEmpty() {
     maxDailyOrdersPerUser: 6,
     occupationLimitMin: 240,
     minCreditToBook: 60,
+    smsGraceMin: 10,
+    proxyExtraWaitMin: 30,
+    storageHours: 72,
+    storageCabinets: 8,
+    storageRemindBeforeHours: 24,
     note: '青年公寓：白天错峰优惠，夜间仅静音机型可启动',
   };
   const oldRules = {
@@ -65,6 +76,11 @@ export async function seedIfEmpty() {
     maxDailyOrdersPerUser: 3,
     occupationLimitMin: 300,
     minCreditToBook: 70,
+    smsGraceMin: 15,
+    proxyExtraWaitMin: 40,
+    storageHours: 96,
+    storageCabinets: 6,
+    storageRemindBeforeHours: 24,
     note: '老旧小区：邻里噪声敏感、限时用水，取衣宽限更长',
   };
   const s1 = await q(`INSERT INTO sites(name, kind, address, rules) VALUES('青松苑 3 栋洗衣房','dorm','青松苑学生宿舍 3 栋 1 层',$1) RETURNING id`, [JSON.stringify(dormRules)]);
@@ -91,7 +107,7 @@ export async function seedIfEmpty() {
     [site2, zone3, 'LW-D201', 'dryer', 9, 'idle', true, 100],
     [site2, zone4, 'LW-W201', 'washer', 13, 'maintenance', false, 100],
     [site3, zone5, 'XF-W101', 'washer', 8, 'idle', true, 70],
-    [site3, zone5, 'XF-W102', 'washer', 8, 'idle', false, 30],
+    [site3, zone5, 'XF-W102', 'washer', 8, 'finished', false, 30],
     [site3, zone5, 'XF-D201', 'dryer', 9, 'offline', false, 100],
   ];
   const did = {};
@@ -135,6 +151,72 @@ export async function seedIfEmpty() {
     `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, booked_at, paid_at)
      VALUES('LD20260916003',$1,$2,$3,$4,'标准洗 35 分钟',35,500,500,'paid','wechat','paid', now()-interval '10 minutes', now()-interval '9 minutes')`,
     [uid.resident3, did['QS-W101'], site1, mode['标准洗 35 分钟'].id]
+  );
+
+  // ---- 超时未取占机处理 · 演示数据 ----
+  // ① 待保洁代取：陈静 XF-W102 已完成并超时 45 分钟（短信已发 45 分钟，无人排队但已过占机处理阈值 → 可代取）
+  const o4 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, reminded, overdue, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline)
+     VALUES('LD20260916004',$1,$2,$3,$4,'标准洗 35 分钟',35,500,500,'paid','wechat','finished', true, true,
+       now()-interval '160 minutes', now()-interval '159 minutes', now()-interval '155 minutes', now()-interval '120 minutes', now()-interval '105 minutes', now()-interval '45 minutes') RETURNING id`,
+    [uid.resident4, did['XF-W102'], site3, mode['标准洗 35 分钟'].id]
+  );
+  await q(
+    `INSERT INTO sms_logs(user_id, phone, kind, content, ref_type, ref_id, created_at) VALUES
+     ($1,'13800000004','timeout_warn','【净邻洗衣】您的订单 LD20260916004（设备 XF-W102）已超过取衣宽限，信用 -5。请立即取衣，超时过久保洁将代取封存并移交保管柜。','order',$2, now()-interval '45 minutes')`,
+    [uid.resident4, o4.rows[0].id]
+  );
+  await q(
+    `INSERT INTO tickets(ticket_no, type, order_id, device_id, site_id, title, description, status, priority, assigned_role)
+     VALUES('TK20260916005','timeout_no_pickup',$1,$2,$3,'超时未取 · XF-W102 · LD20260916004','用户超过取衣宽限时间未取衣，请保洁现场核实并代收衣物，释放设备。','open','normal','cleaner')`,
+    [o4.rows[0].id, did['XF-W102'], site3]
+  );
+  await q(
+    `INSERT INTO credit_records(user_id, delta, balance, reason, ref_type, ref_id, created_at) VALUES
+     ($1,-5,85,'超时未取衣（订单 LD20260916004）','order',$2, now()-interval '45 minutes')`,
+    [uid.resident4, o4.rows[0].id]
+  );
+  await q(`UPDATE users SET credit=85 WHERE id=$1`, [uid.resident4]);
+
+  // ② 保管中待用户取回：李娜昨天的订单已被保洁代取，封袋存 A-3 柜，保管 72 小时（剩余约 70 小时）
+  const o5 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, overdue, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline, closed_at)
+     VALUES('LD20260915002',$1,$2,$3,$4,'轻柔洗 30 分钟',30,550,550,'paid','wechat','expired', true,
+       now()-interval '26 hours', now()-interval '26 hours', now()-interval '25 hours', now()-interval '24 hours', now()-interval '24 hours', now()-interval '23 hours', now()-interval '2 hours') RETURNING id`,
+    [uid.resident2, did['LW-W101'], site2, mode['轻柔洗 30 分钟'].id]
+  );
+  await q(
+    `INSERT INTO proxy_pickups(pickup_no, order_id, user_id, device_id, site_id, cleaner_id, photo_url, bag_no, cabinet_no, pickup_code, storage_hours, store_until, status, note, collected_at)
+     VALUES('PX20260915001',$1,$2,$3,$4,$5,'','BAG20260915001','A-3','528316',72, now()+interval '70 hours','stored','丝绸衬衣两件，已封袋', now()-interval '2 hours')`,
+    [o5.rows[0].id, uid.resident2, did['LW-W101'], site2, uid.cleaner1]
+  );
+  await q(
+    `INSERT INTO notifications(user_id, type, title, body, created_at) VALUES
+     ($1,'proxy','衣物已由保洁代取封存','你在设备 LW-W101 的衣物超时占机，已由保洁拍照代取。封袋编号 BAG20260915001，存放柜 A-3，取件码 528316。请在 72 小时内到「我的-代取任务」核对取回，逾期将移交物业。', now()-interval '2 hours')`,
+    [uid.resident2]
+  );
+
+  // ③ 已逾期移交物业：王强 5 天前的订单代取后保管 96 小时期满未取 → 进入遗留物流程
+  const o6 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, overdue, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline, closed_at)
+     VALUES('LD20260913001',$1,$2,$3,$4,'快洗 15 分钟',15,300,300,'paid','alipay','expired', true,
+       now()-interval '5 days', now()-interval '5 days', now()-interval '5 days', now()-interval '5 days', now()-interval '5 days', now()-interval '5 days', now()-interval '5 days') RETURNING id`,
+    [uid.resident3, did['XF-W101'], site3, mode['快洗 15 分钟'].id]
+  );
+  await q(
+    `INSERT INTO proxy_pickups(pickup_no, order_id, user_id, device_id, site_id, cleaner_id, photo_url, bag_no, cabinet_no, pickup_code, storage_hours, store_until, status, note, collected_at, escalated_at)
+     VALUES('PX20260913001',$1,$2,$3,$4,$5,'','BAG20260913001','A-1','904152',96, now()-interval '1 days','escalated','运动服一袋，已封袋', now()-interval '5 days', now()-interval '1 days')`,
+    [o6.rows[0].id, uid.resident3, did['XF-W101'], site3, uid.cleaner1]
+  );
+  await q(
+    `INSERT INTO lost_items(site_id, device_id, order_id, description, status, found_by, keeper, created_at) VALUES
+     ($1,$2,$3,'代取逾期衣物（封袋 BAG20260913001，原存 A-1 柜）','stored',$4,'物业保管柜', now()-interval '1 days')`,
+    [site3, did['XF-W101'], o6.rows[0].id, uid.cleaner1]
+  );
+  await q(
+    `INSERT INTO tickets(ticket_no, type, order_id, device_id, site_id, title, description, status, priority, assigned_role, created_at)
+     VALUES('TK20260916006','lost_escalation',$1,$2,$3,'代取衣物逾期移交物业 · 封袋 BAG20260913001','代取单 PX20260913001（封袋 BAG20260913001，柜号 A-1）保管 96 小时期满用户未取回，衣物已转入物业保管柜，请物业按遗留物规定处理。','open','normal','property', now()-interval '1 days')`,
+    [o6.rows[0].id, did['XF-W101'], site3]
   );
 
   // ---- 历史订单（用于利用率统计）----

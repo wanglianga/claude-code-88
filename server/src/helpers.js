@@ -42,6 +42,68 @@ export async function notify(userId, type, title, body = '') {
   await q('INSERT INTO notifications(user_id, type, title, body) VALUES($1,$2,$3,$4)', [userId, type, title, body]);
 }
 
+/** 模拟发送短信（写 sms_logs 留档，返回记录） */
+export async function sendSms(userId, kind, content, refType = null, refId = null) {
+  const u = await one('SELECT phone FROM users WHERE id=$1', [userId]);
+  const r = await q(
+    'INSERT INTO sms_logs(user_id, phone, kind, content, ref_type, ref_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',
+    [userId, u?.phone || '', kind, content, refType, refId]
+  );
+  console.log(`[sms] → ${u?.phone || userId} [${kind}] ${content}`);
+  return r.rows[0];
+}
+
+/**
+ * 保洁代取资格判断：根据 取衣倒计时 / 超时提醒短信 / 排队人数 三项条件决定是否允许代取。
+ * 1. 倒计时：订单已超时（取衣宽限倒计时结束）；
+ * 2. 短信：超时提醒短信已发送且已过 rules.smsGraceMin 分钟（默认 10），给用户留响应时间；
+ * 3. 排队：设备有人排队 → 短信条件满足即可代取；无人排队 → 需超时满 rules.proxyExtraWaitMin 分钟（默认 30）。
+ * 返回 { eligible, checks:[{key,label,ok,detail}] }
+ */
+export function proxyEligibility(order, rules, queueCount, smsSentAt, now = new Date()) {
+  const smsGraceMin = rules?.smsGraceMin ?? 10;
+  const extraWaitMin = rules?.proxyExtraWaitMin ?? 30;
+  const checks = [];
+
+  // 条件 1：取衣倒计时已结束
+  const overdueMs = order.pickup_deadline ? now - new Date(order.pickup_deadline) : 0;
+  const timeoutOk = overdueMs > 0;
+  checks.push({
+    key: 'countdown',
+    label: '取衣倒计时已结束',
+    ok: timeoutOk,
+    detail: timeoutOk ? `已超时 ${Math.floor(overdueMs / 60000)} 分钟` : '仍在取衣宽限内',
+  });
+
+  // 条件 2：超时提醒短信已发出且等待期已满
+  const smsWaitOk = !!smsSentAt && now - new Date(smsSentAt) >= smsGraceMin * 60000;
+  checks.push({
+    key: 'sms',
+    label: `超时短信已提醒满 ${smsGraceMin} 分钟`,
+    ok: smsWaitOk,
+    detail: !smsSentAt
+      ? '超时提醒短信尚未发送'
+      : smsWaitOk
+        ? `短信已于 ${new Date(smsSentAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 发出`
+        : `短信已发出，等待用户响应（满 ${smsGraceMin} 分钟可代取）`,
+  });
+
+  // 条件 3：排队人数 —— 有人排队可即时代取；无人排队需超时更久
+  const queueOk = queueCount >= 1 || overdueMs >= extraWaitMin * 60000;
+  checks.push({
+    key: 'queue',
+    label: queueCount >= 1 ? `设备有 ${queueCount} 人排队` : `无人排队需超时满 ${extraWaitMin} 分钟`,
+    ok: queueOk,
+    detail: queueCount >= 1
+      ? '排队用户等待设备，可代取释放'
+      : queueOk
+        ? `已超时 ${Math.floor(overdueMs / 60000)} 分钟，达到占机处理阈值`
+        : `当前无人排队，超时满 ${extraWaitMin} 分钟才允许代取`,
+  });
+
+  return { eligible: checks.every((c) => c.ok), checks };
+}
+
 /** 调整用户信用分并留档 */
 export async function adjustCredit(client, userId, delta, reason, refType = null, refId = null) {
   const r = await client.query('UPDATE users SET credit = GREATEST(0, LEAST(120, credit + $1)) WHERE id=$2 RETURNING credit', [delta, userId]);

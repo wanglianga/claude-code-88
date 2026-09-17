@@ -2,14 +2,14 @@
 import { computed, onMounted, ref } from 'vue';
 import { api } from '../api';
 import type { Site } from '../types';
-import { DEVICE_STATUS, SITE_KIND, TICKET_TYPES, fen, fmtTime, LOST_STATUS, REFUND_STATUS } from '../utils';
+import { DEVICE_STATUS, SITE_KIND, TICKET_TYPES, fen, fmtTime, LOST_STATUS, PROXY_STATUS, REFUND_STATUS } from '../utils';
 import { ok, err } from '../toast';
 
 const sites = ref<Site[]>([]);
 const siteId = ref(0);
 const overview = ref<any>(null);
 const suggestions = ref<{ level: string; title: string; detail: string }[]>([]);
-const archives = ref<any>({ refunds: [], repairs: [], wrongPickups: [], lostItems: [], credits: [] });
+const archives = ref<any>({ refunds: [], repairs: [], wrongPickups: [], lostItems: [], credits: [], proxyPickups: [] });
 const users = ref<any[]>([]);
 const zones = ref<any[]>([]);
 const tab = ref<'stats' | 'rules' | 'archives' | 'users'>('stats');
@@ -49,6 +49,11 @@ async function loadAll() {
     pickupGraceMin: r.pickupGraceMin ?? 30,
     maxDailyOrdersPerUser: r.maxDailyOrdersPerUser ?? 4,
     minCreditToBook: r.minCreditToBook ?? 60,
+    smsGraceMin: r.smsGraceMin ?? 10,
+    proxyExtraWaitMin: r.proxyExtraWaitMin ?? 30,
+    storageHours: r.storageHours ?? 72,
+    storageCabinets: r.storageCabinets ?? 8,
+    storageRemindBeforeHours: r.storageRemindBeforeHours ?? 24,
     peakPricing: JSON.parse(JSON.stringify(r.peakPricing?.length ? r.peakPricing : [{ start: '18:00', end: '22:00', multiplier: 1.2, label: '晚高峰加价' }])),
     offPeak: JSON.parse(JSON.stringify(r.offPeak?.length ? r.offPeak : [{ start: '09:00', end: '16:00', multiplier: 0.85, label: '错峰优惠' }])),
     note: r.note ?? '',
@@ -220,6 +225,35 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div class="section-title">超时未取 · 代取与保管</div>
+        <div class="form-row">
+          <div class="field">
+            <label>短信提醒后等待（分钟，期满保洁才可代取）</label>
+            <input class="input" type="number" v-model.number="rulesForm.smsGraceMin" />
+          </div>
+          <div class="field">
+            <label>无人排队占机阈值（分钟，超时满后才可代取）</label>
+            <input class="input" type="number" v-model.number="rulesForm.proxyExtraWaitMin" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>代取保管期限（小时，逾期移交物业）</label>
+            <input class="input" type="number" v-model.number="rulesForm.storageHours" />
+          </div>
+          <div class="field">
+            <label>到期前提醒（小时）</label>
+            <input class="input" type="number" v-model.number="rulesForm.storageRemindBeforeHours" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>保管柜数量（柜号 A-1 ~ A-n）</label>
+            <input class="input" type="number" v-model.number="rulesForm.storageCabinets" />
+          </div>
+          <div></div>
+        </div>
+
         <div class="section-title">高峰加价（错峰价格）</div>
         <div v-for="(p, i) in rulesForm.peakPricing" :key="'p' + i" class="row" style="margin-bottom:8px">
           <input class="input" style="max-width:100px" v-model="p.start" placeholder="开始" />
@@ -314,6 +348,27 @@ onMounted(async () => {
           <div v-else class="empty">暂无遗留物</div>
         </div>
 
+        <div class="card">
+          <div class="card-title">代取保管档案 <span class="sub">超时占机代取全记录</span></div>
+          <div style="max-height:320px;overflow-y:auto">
+            <table class="table" v-if="archives.proxyPickups.length">
+              <thead><tr><th>封袋编号</th><th>用户</th><th>柜号</th><th>保管截止</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr v-for="p in archives.proxyPickups" :key="p.id">
+                  <td style="font-weight:700">{{ p.bag_no }}<br /><span class="muted" style="font-weight:400">{{ p.order_no }}</span></td>
+                  <td>{{ p.user_name }}<br /><span class="muted">{{ p.cleaner_name }} 代取</span></td>
+                  <td>{{ p.cabinet_no }}</td>
+                  <td class="muted">{{ fmtTime(p.store_until) }}</td>
+                  <td><span class="badge" :class="PROXY_STATUS[p.status]?.cls">{{ PROXY_STATUS[p.status]?.label }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="empty">暂无代取记录</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-2 mt16">
         <div class="card">
           <div class="card-title">用户信用档案（全部）</div>
           <div style="max-height:320px;overflow-y:auto">
