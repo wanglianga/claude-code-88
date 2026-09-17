@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { api } from '../api';
-import type { Board, Device, Order, Quote, Site, WashMode } from '../types';
+import type { Board, Device, Order, ProxyPickup, Quote, Site, WashMode } from '../types';
 import { DEVICE_STATUS, ORDER_STATUS, PAY_STATUS, fen, fmtTime, remainText, overdueText, SITE_KIND } from '../utils';
 import { ok, err } from '../toast';
 import DeviceCard from '../components/DeviceCard.vue';
 import Modal from '../components/Modal.vue';
+import ProxyConfirmModal from '../components/ProxyConfirmModal.vue';
 
 const sites = ref<Site[]>([]);
 const siteId = ref<number>(0);
 const board = ref<Board | null>(null);
 const active = ref<Order | null>(null);
+const proxyTasks = ref<ProxyPickup[]>([]);
+const confirmTask = ref<ProxyPickup | null>(null);
 const now = ref(Date.now());
 const loading = ref(false);
 
@@ -79,8 +82,13 @@ async function loadActive() {
   active.value = await api.get<Order | null>('/api/orders/active');
 }
 
+async function loadProxy() {
+  const rows = await api.get<ProxyPickup[]>('/api/proxy-pickups/mine');
+  proxyTasks.value = rows.filter((r) => r.status === 'stored');
+}
+
 async function refresh() {
-  await Promise.all([loadBoard(), loadActive()]);
+  await Promise.all([loadBoard(), loadActive(), loadProxy()]);
 }
 
 async function switchSite(id: number) {
@@ -241,6 +249,33 @@ onUnmounted(() => { clearInterval(tickTimer); clearInterval(pollTimer); });
       </div>
     </div>
 
+    <!-- 代取确认任务（保洁已代取，待用户核对取回） -->
+    <div v-for="p in proxyTasks" :key="p.id" class="card mt16" style="border-left:4px solid var(--amber)">
+      <div class="spread">
+        <div class="card-title" style="margin:0">
+          🧳 衣物已被保洁代取，待核对取回
+          <span class="badge st-queued">在柜待取</span>
+        </div>
+        <span class="muted">{{ p.order_no }}</span>
+      </div>
+      <div class="grid grid-4 mt12">
+        <div><div class="muted">封袋编号</div><b>{{ p.bag_no }}</b></div>
+        <div><div class="muted">存放柜</div><b>{{ p.cabinet_no }} 柜</b>（{{ p.site_name }}）</div>
+        <div><div class="muted">代取保洁</div><b>{{ p.cleaner_name }}</b></div>
+        <div>
+          <div class="muted">保管期限倒计时</div>
+          <b v-if="remainText(p.keep_until, now)" :style="{ color: 'var(--amber)' }">{{ remainText(p.keep_until, now) }}</b>
+          <b v-else style="color:var(--red)">已逾期</b>
+        </div>
+      </div>
+      <div class="alert warn mt12">
+        ⏳ 保管至 {{ fmtTime(p.keep_until) }}，逾期将移交物业按遗留物处理并扣减信用。取回时需核对封袋编号并到柜扫码确认。
+      </div>
+      <div class="row mt12">
+        <button class="btn btn-green" @click="confirmTask = p">✅ 核对取回</button>
+      </div>
+    </div>
+
     <!-- 进行中订单 -->
     <div v-if="active" class="card mt16" style="border-left:4px solid var(--primary)">
       <div class="spread">
@@ -308,7 +343,10 @@ onUnmounted(() => { clearInterval(tickTimer); clearInterval(pollTimer); });
       <!-- 待取衣 -->
       <div v-else-if="active.status === 'finished'" class="mt12">
         <div v-if="pickupRemain" class="alert info">👕 洗涤完成！取衣倒计时 <b>{{ pickupRemain }}</b>，超时将扣减信用并由保洁代收</div>
-        <div v-else class="alert error">⚠️ 已超时 {{ pickupOverdue }}！信用已扣减，请立即取衣，逾期将由保洁代收存入遗留物柜</div>
+        <div v-else class="alert error">
+          ⚠️ 已超时 {{ pickupOverdue }}！信用已扣减，系统已短信提醒 {{ active.sms_count ?? 0 }} 次。
+          持续超时且有人排队（当前 {{ active.queue_count ?? 0 }} 人）时，保洁将拍照封袋代收入柜。
+        </div>
         <div class="row mt12">
           <button class="btn btn-green" @click="pickup">✅ 我已取衣</button>
           <button class="btn btn-outline" :disabled="!!active.pickup_auth" @click="authorizePickup">
@@ -382,5 +420,8 @@ onUnmounted(() => { clearInterval(tickTimer); clearInterval(pollTimer); });
       <div class="alert info">提交后将生成工单，客服 / 保洁 / 维修 / 物业会围绕本订单协同处理，处理进度可在「我的工单」查看。</div>
       <button class="btn btn-primary btn-block mt12" @click="submitReport">提交</button>
     </Modal>
+
+    <!-- 代取衣物核对取回弹窗 -->
+    <ProxyConfirmModal v-if="confirmTask" :task="confirmTask" @close="confirmTask = null" @done="refresh" />
   </div>
 </template>

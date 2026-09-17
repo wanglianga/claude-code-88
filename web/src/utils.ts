@@ -72,6 +72,7 @@ export const TICKET_TYPES: Record<string, string> = {
   door_stuck: '门锁打不开',
   refund_request: '退款申请',
   timeout_no_pickup: '超时未取',
+  leftover_overdue: '保管逾期遗留',
   noise: '噪声投诉',
   dispute: '物业纠纷',
   device_fault: '设备故障',
@@ -92,6 +93,13 @@ export const PAY_STATUS: Record<string, string> = {
 
 export const LOST_STATUS: Record<string, string> = {
   stored: '保管中', claimed: '认领中', returned: '已归还', disposed: '已处理',
+};
+
+export const PROXY_STATUS: Record<string, { label: string; cls: string }> = {
+  stored: { label: '在柜待取', cls: 'st-queued' },
+  returned: { label: '已取回', cls: 'st-idle' },
+  escalated: { label: '逾期转物业', cls: 'st-fault' },
+  disposed: { label: '已处理', cls: 'st-offline' },
 };
 
 export const REFUND_STATUS: Record<string, string> = {

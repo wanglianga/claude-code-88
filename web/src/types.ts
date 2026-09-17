@@ -21,6 +21,8 @@ export interface SiteRules {
   peakPricing?: PriceRule[];
   offPeak?: PriceRule[];
   pickupGraceMin?: number;
+  proxyCollectAfterMin?: number;
+  proxyKeepHours?: number;
   maxDailyOrdersPerUser?: number;
   occupationLimitMin?: number;
   minCreditToBook?: number;
@@ -71,6 +73,7 @@ export interface Order {
   id: number; order_no: string; user_id: number; device_id: number; site_id: number;
   mode_name: string; duration_min: number; price_cents: number; discount_cents: number; amount_cents: number;
   pay_status: string; pay_method?: string; status: string; reminded: boolean; overdue: boolean;
+  sms_count?: number;
   booked_at: string; paid_at?: string; started_at?: string; ends_at?: string;
   finished_at?: string; pickup_deadline?: string; picked_up_at?: string; closed_at?: string;
   device_code?: string; device_type?: string; site_name?: string; silent?: boolean;
@@ -78,6 +81,28 @@ export interface Order {
   lost_item?: { id: number; status: string; keeper: string } | null;
   pickup_auth?: { id: number; status: string } | null;
   rules?: SiteRules;
+}
+
+/** 保洁代取资格评估（倒计时 / 短信提醒 / 排队人数） */
+export interface ProxyEligibility {
+  overdue: boolean; overdueMin: number; smsCount: number; smsOk: boolean;
+  queueCount: number; queueOk: boolean; afterMin: number; canProxy: boolean; reason: string;
+}
+
+/** 保洁任务台的待取订单（含代取资格评估） */
+export interface PickupOrderTask {
+  id: number; order_no: string; mode_name?: string; pickup_deadline: string; overdue: boolean;
+  sms_count: number; user_name: string; device_id: number; device_code: string; site_name: string;
+  queue_count: number; eligibility: ProxyEligibility;
+}
+
+/** 保洁代取记录（用户确认任务） */
+export interface ProxyPickup {
+  id: number; order_id: number; bag_no: string; cabinet_no: string; photo_note?: string;
+  status: 'stored' | 'returned' | 'escalated' | 'disposed';
+  keep_until: string; keep_reminded?: boolean; created_at: string; returned_at?: string; escalated_at?: string;
+  order_no?: string; mode_name?: string; device_code?: string; site_name?: string;
+  user_name?: string; cleaner_name?: string;
 }
 
 export interface Ticket {

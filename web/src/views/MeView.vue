@@ -2,28 +2,35 @@
 import { onMounted, ref } from 'vue';
 import { api } from '../api';
 import { useAuthStore } from '../stores/auth';
-import type { CreditRecord, LostItem, Notification, Package, Refund } from '../types';
-import { fen, fmtTime, LOST_STATUS, REFUND_STATUS } from '../utils';
+import type { CreditRecord, LostItem, Notification, Package, ProxyPickup, Refund } from '../types';
+import { fen, fmtTime, remainText, LOST_STATUS, PROXY_STATUS, REFUND_STATUS } from '../utils';
 import { ok, err } from '../toast';
+import ProxyConfirmModal from '../components/ProxyConfirmModal.vue';
 
 const auth = useAuthStore();
 const packages = ref<Package[]>([]);
 const credits = ref<CreditRecord[]>([]);
 const lostItems = ref<LostItem[]>([]);
 const refunds = ref<Refund[]>([]);
-const tab = ref<'notif' | 'credit' | 'lost' | 'refund'>('notif');
+const proxyTasks = ref<ProxyPickup[]>([]);
+const confirmTask = ref<ProxyPickup | null>(null);
+const now = ref(Date.now());
+const tab = ref<'notif' | 'credit' | 'proxy' | 'lost' | 'refund'>('notif');
 
 async function load() {
-  const [p, c, l, r] = await Promise.all([
+  const [p, c, l, r, px] = await Promise.all([
     api.get<Package[]>('/api/packages'),
     api.get<CreditRecord[]>('/api/me/credit-records'),
     api.get<LostItem[]>('/api/lost-items'),
     api.get<Refund[]>('/api/refunds'),
+    api.get<ProxyPickup[]>('/api/proxy-pickups/mine'),
   ]);
   packages.value = p;
   credits.value = c;
   lostItems.value = l;
   refunds.value = r;
+  proxyTasks.value = px;
+  now.value = Date.now();
   await auth.loadNotifications();
 }
 
@@ -98,6 +105,9 @@ onMounted(load);
     <div class="tabs mt16">
       <div class="tab" :class="{ active: tab === 'notif' }" @click="tab = 'notif'">通知 <span v-if="auth.unread" class="badge st-fault">{{ auth.unread }}</span></div>
       <div class="tab" :class="{ active: tab === 'credit' }" @click="tab = 'credit'">信用档案</div>
+      <div class="tab" :class="{ active: tab === 'proxy' }" @click="tab = 'proxy'">
+        代取任务 <span v-if="proxyTasks.filter((t) => t.status === 'stored').length" class="badge st-queued">{{ proxyTasks.filter((t) => t.status === 'stored').length }}</span>
+      </div>
       <div class="tab" :class="{ active: tab === 'lost' }" @click="tab = 'lost'">遗留物</div>
       <div class="tab" :class="{ active: tab === 'refund' }" @click="tab = 'refund'">退款记录</div>
     </div>
@@ -133,6 +143,37 @@ onMounted(load);
         </tbody>
       </table>
       <div v-else class="empty">暂无信用记录</div>
+    </div>
+
+    <div v-if="tab === 'proxy'" class="card">
+      <div class="card-title">代取确认任务 <span class="sub">保洁代取封袋的衣物，取回时需核对封袋编号并扫码确认</span></div>
+      <table class="table" v-if="proxyTasks.length">
+        <thead><tr><th>封袋编号</th><th>存放柜</th><th>门店 / 设备</th><th>关联订单</th><th>保管期限</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="t in proxyTasks" :key="t.id">
+            <td style="font-weight:700">{{ t.bag_no }}</td>
+            <td><span class="badge st-queued">{{ t.cabinet_no }}</span></td>
+            <td>{{ t.site_name }} {{ t.device_code }}</td>
+            <td class="muted">{{ t.order_no }}</td>
+            <td>
+              <template v-if="t.status === 'stored'">
+                <span v-if="remainText(t.keep_until, now)" class="badge soft">剩余 {{ remainText(t.keep_until, now) }}</span>
+                <span v-else class="badge st-fault">已逾期</span>
+                <div class="muted" style="font-size:12px">至 {{ fmtTime(t.keep_until) }}</div>
+              </template>
+              <span v-else class="muted">{{ fmtTime(t.keep_until) }} 止</span>
+            </td>
+            <td><span class="badge" :class="PROXY_STATUS[t.status]?.cls">{{ PROXY_STATUS[t.status]?.label }}</span></td>
+            <td>
+              <button v-if="t.status === 'stored'" class="btn btn-green btn-sm" @click="confirmTask = t">核对取回</button>
+              <span v-else-if="t.status === 'escalated'" class="muted" style="font-size:12px">已转遗留物，请到「遗留物」认领</span>
+              <span v-else class="muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else class="empty">暂无代取记录</div>
+      <p class="muted mt8" v-if="proxyTasks.length">提示：保管期限内未取回的衣物将移交物业按遗留物处理并扣减信用。</p>
     </div>
 
     <div v-if="tab === 'lost'" class="card">
@@ -173,5 +214,8 @@ onMounted(load);
       </table>
       <div v-else class="empty">暂无退款记录</div>
     </div>
+
+    <!-- 代取衣物核对取回弹窗 -->
+    <ProxyConfirmModal v-if="confirmTask" :task="confirmTask" @close="confirmTask = null" @done="load" />
   </div>
 </template>

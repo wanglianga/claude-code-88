@@ -2,14 +2,14 @@
 import { computed, onMounted, ref } from 'vue';
 import { api } from '../api';
 import type { Site } from '../types';
-import { DEVICE_STATUS, SITE_KIND, TICKET_TYPES, fen, fmtTime, LOST_STATUS, REFUND_STATUS } from '../utils';
+import { DEVICE_STATUS, SITE_KIND, TICKET_TYPES, fen, fmtTime, LOST_STATUS, PROXY_STATUS, REFUND_STATUS } from '../utils';
 import { ok, err } from '../toast';
 
 const sites = ref<Site[]>([]);
 const siteId = ref(0);
 const overview = ref<any>(null);
 const suggestions = ref<{ level: string; title: string; detail: string }[]>([]);
-const archives = ref<any>({ refunds: [], repairs: [], wrongPickups: [], lostItems: [], credits: [] });
+const archives = ref<any>({ refunds: [], repairs: [], wrongPickups: [], lostItems: [], credits: [], proxyPickups: [] });
 const users = ref<any[]>([]);
 const zones = ref<any[]>([]);
 const tab = ref<'stats' | 'rules' | 'archives' | 'users'>('stats');
@@ -47,6 +47,8 @@ async function loadAll() {
     nightSilent: { enabled: r.nightSilent?.enabled ?? true, start: r.nightSilent?.start ?? '22:00', end: r.nightSilent?.end ?? '07:00' },
     allowNightStart: r.allowNightStart ?? false,
     pickupGraceMin: r.pickupGraceMin ?? 30,
+    proxyCollectAfterMin: r.proxyCollectAfterMin ?? 15,
+    proxyKeepHours: r.proxyKeepHours ?? 48,
     maxDailyOrdersPerUser: r.maxDailyOrdersPerUser ?? 4,
     minCreditToBook: r.minCreditToBook ?? 60,
     peakPricing: JSON.parse(JSON.stringify(r.peakPricing?.length ? r.peakPricing : [{ start: '18:00', end: '22:00', multiplier: 1.2, label: '晚高峰加价' }])),
@@ -205,6 +207,16 @@ onMounted(async () => {
             <input class="input" type="number" v-model.number="rulesForm.pickupGraceMin" />
           </div>
           <div class="field">
+            <label>代取宽限（分钟，无人排队时超时满该时长才允许保洁代取）</label>
+            <input class="input" type="number" v-model.number="rulesForm.proxyCollectAfterMin" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>代取保管期限（小时，逾期移交物业遗留物）</label>
+            <input class="input" type="number" v-model.number="rulesForm.proxyKeepHours" />
+          </div>
+          <div class="field">
             <label>每日预约上限（单用户，防恶意占用）</label>
             <input class="input" type="number" v-model.number="rulesForm.maxDailyOrdersPerUser" />
           </div>
@@ -314,6 +326,26 @@ onMounted(async () => {
           <div v-else class="empty">暂无遗留物</div>
         </div>
 
+        <div class="card">
+          <div class="card-title">代取保管档案 <span class="sub">超时占机代取全记录</span></div>
+          <table class="table" v-if="archives.proxyPickups?.length">
+            <thead><tr><th>封袋</th><th>柜</th><th>物主</th><th>保洁</th><th>状态</th><th>时间</th></tr></thead>
+            <tbody>
+              <tr v-for="p in archives.proxyPickups" :key="p.id">
+                <td style="font-weight:700">{{ p.bag_no }}</td>
+                <td>{{ p.cabinet_no }}</td>
+                <td>{{ p.user_name }}</td>
+                <td>{{ p.cleaner_name }}</td>
+                <td><span class="badge" :class="PROXY_STATUS[p.status]?.cls">{{ PROXY_STATUS[p.status]?.label }}</span></td>
+                <td class="muted">{{ fmtTime(p.created_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty">暂无代取记录</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2 mt16">
         <div class="card">
           <div class="card-title">用户信用档案（全部）</div>
           <div style="max-height:320px;overflow-y:auto">

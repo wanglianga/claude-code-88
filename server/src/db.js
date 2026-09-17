@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked','paid','running','finished','picked','closed','cancelled','expired')),
   reminded BOOLEAN NOT NULL DEFAULT false,
   overdue BOOLEAN NOT NULL DEFAULT false,
+  sms_count INT NOT NULL DEFAULT 0,
+  last_sms_at TIMESTAMPTZ,
   booked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   paid_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
@@ -230,6 +232,27 @@ CREATE TABLE IF NOT EXISTS pickup_auths (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   used_at TIMESTAMPTZ
 );
+-- 保洁代取记录：超时未取占机处理的核心档案（拍照/封袋/入柜/用户确认/逾期转物业）
+CREATE TABLE IF NOT EXISTS proxy_pickups (
+  id SERIAL PRIMARY KEY,
+  order_id INT NOT NULL REFERENCES orders(id),
+  user_id INT NOT NULL REFERENCES users(id),
+  cleaner_id INT NOT NULL REFERENCES users(id),
+  site_id INT NOT NULL REFERENCES sites(id),
+  device_id INT REFERENCES devices(id),
+  photo_note TEXT NOT NULL,
+  bag_no TEXT UNIQUE NOT NULL,
+  cabinet_no TEXT NOT NULL,
+  confirm_code TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'stored' CHECK (status IN ('stored','returned','escalated','disposed')),
+  keep_until TIMESTAMPTZ NOT NULL,
+  keep_reminded BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  returned_at TIMESTAMPTZ,
+  escalated_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_user ON proxy_pickups(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_proxy_status ON proxy_pickups(status, keep_until);
 CREATE TABLE IF NOT EXISTS repairs (
   id SERIAL PRIMARY KEY,
   device_id INT NOT NULL REFERENCES devices(id),
@@ -245,4 +268,7 @@ CREATE TABLE IF NOT EXISTS repairs (
 
 export async function migrate() {
   await pool.query(SCHEMA);
+  // 增量列（老库升级）：超时未取的短信提醒计数
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS sms_count INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS last_sms_at TIMESTAMPTZ`);
 }

@@ -11,6 +11,7 @@ export async function seedIfEmpty() {
     ['resident1', '张伟', 'resident', '13800000001', 100],
     ['resident2', '李娜', 'resident', '13800000002', 96],
     ['resident3', '王强', 'resident', '13800000003', 55],
+    ['resident4', '陈静', 'resident', '13800000004', 95],
     ['service1', '王客服', 'service', '13800000011', 100],
     ['cleaner1', '刘保洁', 'cleaner', '13800000012', 100],
     ['repair1', '赵维修', 'maintenance', '13800000013', 100],
@@ -40,6 +41,8 @@ export async function seedIfEmpty() {
     peakPricing: [{ start: '18:00', end: '22:00', multiplier: 1.2, label: '晚高峰加价' }],
     offPeak: [{ start: '08:00', end: '11:00', multiplier: 0.8, label: '早间错峰 8 折' }],
     pickupGraceMin: 30,
+    proxyCollectAfterMin: 15,
+    proxyKeepHours: 48,
     maxDailyOrdersPerUser: 4,
     occupationLimitMin: 180,
     minCreditToBook: 60,
@@ -51,6 +54,8 @@ export async function seedIfEmpty() {
     peakPricing: [{ start: '19:00', end: '23:00', multiplier: 1.15, label: '晚间高峰' }],
     offPeak: [{ start: '09:00', end: '16:00', multiplier: 0.85, label: '白天错峰 85 折' }],
     pickupGraceMin: 45,
+    proxyCollectAfterMin: 15,
+    proxyKeepHours: 72,
     maxDailyOrdersPerUser: 6,
     occupationLimitMin: 240,
     minCreditToBook: 60,
@@ -62,6 +67,8 @@ export async function seedIfEmpty() {
     peakPricing: [],
     offPeak: [{ start: '13:00', end: '16:00', multiplier: 0.9, label: '午后 9 折' }],
     pickupGraceMin: 60,
+    proxyCollectAfterMin: 30,
+    proxyKeepHours: 72,
     maxDailyOrdersPerUser: 3,
     occupationLimitMin: 300,
     minCreditToBook: 70,
@@ -91,7 +98,7 @@ export async function seedIfEmpty() {
     [site2, zone3, 'LW-D201', 'dryer', 9, 'idle', true, 100],
     [site2, zone4, 'LW-W201', 'washer', 13, 'maintenance', false, 100],
     [site3, zone5, 'XF-W101', 'washer', 8, 'idle', true, 70],
-    [site3, zone5, 'XF-W102', 'washer', 8, 'idle', false, 30],
+    [site3, zone5, 'XF-W102', 'washer', 8, 'finished', false, 30],
     [site3, zone5, 'XF-D201', 'dryer', 9, 'offline', false, 100],
   ];
   const did = {};
@@ -135,6 +142,52 @@ export async function seedIfEmpty() {
     `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, booked_at, paid_at)
      VALUES('LD20260916003',$1,$2,$3,$4,'标准洗 35 分钟',35,500,500,'paid','wechat','paid', now()-interval '10 minutes', now()-interval '9 minutes')`,
     [uid.resident3, did['QS-W101'], site1, mode['标准洗 35 分钟'].id]
+  );
+
+  // ---- 超时未取占机处理演示 ----
+  // XF-W102 陈静标准洗已完成，已超时 20 分钟未取，系统已发 2 次短信提醒（保洁可评估代取）
+  const o4 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, overdue, sms_count, last_sms_at, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline)
+     VALUES('LD20260916004',$1,$2,$3,$4,'标准洗 35 分钟',35,500,500,'paid','wechat','finished', true, 2, now()-interval '12 minutes',
+       now()-interval '2 hours', now()-interval '119 minutes', now()-interval '115 minutes', now()-interval '80 minutes', now()-interval '80 minutes', now()-interval '20 minutes') RETURNING id`,
+    [uid.resident4, did['XF-W102'], site3, mode['标准洗 35 分钟'].id]
+  );
+  // 超时工单（保洁待处理）
+  await q(
+    `INSERT INTO tickets(ticket_no, type, order_id, device_id, site_id, title, description, status, priority, assigned_role)
+     VALUES('TK20260916005','timeout_no_pickup',$1,$2,$3,'超时未取 · XF-W102 · LD20260916004','用户超过取衣宽限时间未取衣，请保洁现场核实并代收衣物，释放设备。','open','normal','cleaner')`,
+    [o4.rows[0].id, did['XF-W102'], site3]
+  );
+  // 陈静超时扣信用记录（与信用分 95 对应）
+  await q(
+    `INSERT INTO credit_records(user_id, delta, balance, reason, ref_type, ref_id, created_at) VALUES($1,-5,95,'超时未取衣（订单 LD20260916004）','order',$2, now()-interval '20 minutes')`,
+    [uid.resident4, o4.rows[0].id]
+  );
+  // 陈静另一笔订单昨天已被保洁代取封袋，在柜待取（保管 72 小时，剩余约 30 小时）→ 演示用户确认任务
+  const o5 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, overdue, sms_count, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline, closed_at)
+     VALUES('LD20260915002',$1,$2,$3,$4,'快洗 15 分钟',15,300,300,'paid','wechat','expired', true, 3,
+       now()-interval '44 hours', now()-interval '43 hours 50 minutes', now()-interval '43 hours 40 minutes', now()-interval '43 hours 25 minutes',
+       now()-interval '43 hours 25 minutes', now()-interval '42 hours 25 minutes', now()-interval '42 hours') RETURNING id`,
+    [uid.resident4, did['XF-W101'], site3, mode['快洗 15 分钟'].id]
+  );
+  await q(
+    `INSERT INTO proxy_pickups(order_id, user_id, cleaner_id, site_id, device_id, photo_note, bag_no, cabinet_no, confirm_code, status, keep_until, created_at)
+     VALUES($1,$2,$3,$4,$5,'现场照片：桶内衣物一袋（外套 1 件、T 恤 2 件），已装入蓝色封袋','BAG20260915301','A-03','PX668899','stored', now()+interval '30 hours', now()-interval '42 hours')`,
+    [o5.rows[0].id, uid.resident4, uid.cleaner1, site3, did['XF-W101']]
+  );
+  // 李娜 3 天前的代取已完成取回（历史档案）
+  const o6 = await q(
+    `INSERT INTO orders(order_no, user_id, device_id, site_id, mode_id, mode_name, duration_min, price_cents, amount_cents, pay_status, pay_method, status, overdue, sms_count, booked_at, paid_at, started_at, ends_at, finished_at, pickup_deadline, closed_at)
+     VALUES('LD20260913001',$1,$2,$3,$4,'标准洗 35 分钟',35,500,500,'paid','alipay','expired', true, 2,
+       now()-interval '3 days 2 hours', now()-interval '3 days 1 hours', now()-interval '3 days 50 minutes', now()-interval '3 days 15 minutes',
+       now()-interval '3 days 15 minutes', now()-interval '2 days 22 hours', now()-interval '3 days') RETURNING id`,
+    [uid.resident2, did['LW-W101'], site2, mode['标准洗 35 分钟'].id]
+  );
+  await q(
+    `INSERT INTO proxy_pickups(order_id, user_id, cleaner_id, site_id, device_id, photo_note, bag_no, cabinet_no, confirm_code, status, keep_until, created_at, returned_at)
+     VALUES($1,$2,$3,$4,$5,'现场照片：桶内床单一条，已装入黄色封袋','BAG20260913301','B-02','PX102030','returned', now()-interval '1 hours', now()-interval '3 days', now()-interval '2 days 20 hours')`,
+    [o6.rows[0].id, uid.resident2, uid.cleaner1, site2, did['LW-W101']]
   );
 
   // ---- 历史订单（用于利用率统计）----

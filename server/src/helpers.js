@@ -122,6 +122,36 @@ export async function activeOrderOfDevice(deviceId) {
   );
 }
 
+/**
+ * 保洁代取资格评估：页面根据「倒计时 / 短信提醒 / 排队人数」决定是否允许代取。
+ * - 倒计时：取衣宽限倒计时已结束（订单已超时）；
+ * - 短信提醒：系统已至少发送 1 次短信提醒用户取衣；
+ * - 排队人数：设备有人排队等机，或无人排队但超时时长已达门店代取宽限（rules.proxyCollectAfterMin，默认 15 分钟）。
+ * 三者同时满足才允许保洁拍照封袋代取。
+ */
+export function proxyEligibility(order, queueCount, rules = {}, now = new Date()) {
+  const deadline = order.pickup_deadline ? new Date(order.pickup_deadline) : null;
+  const overdueMin = deadline ? Math.max(0, Math.floor((now.getTime() - deadline.getTime()) / 60000)) : 0;
+  const overdue = !!order.overdue || overdueMin > 0;
+  const smsCount = order.sms_count || 0;
+  const afterMin = rules.proxyCollectAfterMin ?? 15;
+  const checks = {
+    overdue,
+    overdueMin,
+    smsCount,
+    smsOk: smsCount >= 1,
+    queueCount,
+    queueOk: queueCount > 0 || overdueMin >= afterMin,
+    afterMin,
+  };
+  const canProxy = checks.overdue && checks.smsOk && checks.queueOk;
+  let reason = '';
+  if (!checks.overdue) reason = '取衣倒计时未结束';
+  else if (!checks.smsOk) reason = '尚未发送短信提醒';
+  else if (!checks.queueOk) reason = `无人排队且超时未满 ${afterMin} 分钟`;
+  return { ...checks, canProxy, reason };
+}
+
 /** 设备排队队列（已支付待启动） */
 export async function queueOfDevice(deviceId) {
   return many(
